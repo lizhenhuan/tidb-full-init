@@ -73,6 +73,30 @@ func (sf *SchemaFetcher) GetTableInfo(database, tableName string) (*encoder.Tabl
 	return tableInfo, tableID, nil
 }
 
+// GetPartitionIDs returns the TIDB_PARTITION_IDs for a partitioned table.
+// Returns an empty slice if the table is not partitioned.
+func (sf *SchemaFetcher) GetPartitionIDs(database, tableName string) ([]int64, error) {
+	rows, err := sf.db.Query(
+		`SELECT DISTINCT TIDB_PARTITION_ID
+		 FROM INFORMATION_SCHEMA.PARTITIONS
+		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND TIDB_PARTITION_ID IS NOT NULL
+		 ORDER BY TIDB_PARTITION_ID`, database, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("query partitions: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan partition id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (sf *SchemaFetcher) getColumns(database, tableName string) ([]encoder.ColumnInfo, error) {
 	rows, err := sf.db.Query(
 		`SELECT ORDINAL_POSITION, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY

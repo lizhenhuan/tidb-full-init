@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -178,23 +179,52 @@ func main() {
 				if mc, ok := tikvClient.(*tikv.MockClient); ok {
 					seedMockData(mc, tableID)
 				}
-			} else {
-				tableInfo, tableID, err = schemaFetcher.GetTableInfo(tc.Database, tableName)
-				if err != nil {
-					log.Fatalf("Get table info for %s.%s: %v", tc.Database, tableName, err)
-				}
-			}
-
-			log.Printf("Starting: %s.%s (tableID=%d, topic=%s)", tc.Database, tableName, tableID, topic)
-
-			rowCount, err := reader.ScanTable(ctx, scanCfg, tableID, tableInfo, kafkaProducer, topic)
+		} else {
+			tableInfo, tableID, err = schemaFetcher.GetTableInfo(tc.Database, tableName)
 			if err != nil {
-				log.Printf("[%s.%s] ERROR: %v", tc.Database, tableName, err)
+				log.Fatalf("Get table info for %s.%s: %v", tc.Database, tableName, err)
+			}
+		}
+
+		// Check for partitions: partitioned tables store data under partition IDs, not the main tableID.
+		var scanIDs []int64
+		if !mockMode {
+			partIDs, err := schemaFetcher.GetPartitionIDs(tc.Database, tableName)
+			if err != nil {
+				log.Fatalf("Get partition IDs for %s.%s: %v", tc.Database, tableName, err)
+			}
+			if len(partIDs) > 0 {
+				log.Printf("[%s.%s] partitioned table with %d partitions: %v", tc.Database, tableName, len(partIDs), partIDs)
+				scanIDs = partIDs
+			} else {
+				scanIDs = []int64{tableID}
+			}
+		} else {
+			scanIDs = []int64{tableID}
+		}
+
+		var totalRowCount int64
+		for _, scanID := range scanIDs {
+			label := fmt.Sprintf("%s.%s", tc.Database, tableName)
+			if len(scanIDs) > 1 {
+				label = fmt.Sprintf("%s.%s [pid=%d]", tc.Database, tableName, scanID)
+			}
+			log.Printf("Starting: %s (topic=%s)", label, topic)
+
+			rowCount, err := reader.ScanTable(ctx, scanCfg, scanID, tableInfo, kafkaProducer, topic)
+			if err != nil {
+				log.Printf("[%s] ERROR: %v", label, err)
 				kafkaProducer.Close()
 				os.Exit(1)
 			}
 
-			log.Printf("[%s.%s] Done: %d rows -> topic %s", tc.Database, tableName, rowCount, topic)
+			log.Printf("[%s] Done: %d rows -> topic %s", label, rowCount, topic)
+			totalRowCount += rowCount
+		}
+
+		if len(scanIDs) > 1 {
+			log.Printf("[%s.%s] All partitions done: %d total rows -> topic %s", tc.Database, tableName, totalRowCount, topic)
+		}
 			kafkaProducer.Close()
 		}
 	}

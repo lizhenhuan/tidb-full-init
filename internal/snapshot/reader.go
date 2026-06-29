@@ -166,8 +166,16 @@ func (r *Reader) scanPartition(
 }
 
 // splitKeyRange divides [start, end) into n partitions for parallel scanning.
+// If the key range is too narrow for effective splitting, returns a single partition.
 func splitKeyRange(start, end []byte, partitions int) [][2][]byte {
 	if partitions <= 1 {
+		return [][2][]byte{{start, end}}
+	}
+
+	// Check if the key range is wide enough to split meaningfully.
+	// If start and end differ by too little (e.g., only tableID boundary),
+	// splitting produces many zero-width partitions.
+	if !canSplitRange(start, end, partitions) {
 		return [][2][]byte{{start, end}}
 	}
 
@@ -185,6 +193,27 @@ func splitKeyRange(start, end []byte, partitions int) [][2][]byte {
 		}
 	}
 	return ranges
+}
+
+// canSplitRange checks if the key range has enough spread for splitting.
+// For table-level key ranges (11 bytes with only tableID differing),
+// each partition needs at least 1 distinct byte value.
+func canSplitRange(start, end []byte, partitions int) bool {
+	maxLen := len(start)
+	if len(end) > maxLen {
+		maxLen = len(end)
+	}
+	s := make([]byte, maxLen)
+	e := make([]byte, maxLen)
+	copy(s[maxLen-len(start):], start)
+	copy(e[maxLen-len(end):], end)
+
+	// Calculate total range width as a big integer
+	var diff uint64
+	for i := 0; i < maxLen; i++ {
+		diff = diff*256 + uint64(e[i]) - uint64(s[i])
+	}
+	return diff >= uint64(partitions)
 }
 
 // calculateSplitPoint evenly divides the key space.
