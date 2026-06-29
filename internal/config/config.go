@@ -21,6 +21,7 @@ type Config struct {
 	Password              string                 `json:"password"`
 	KafkaBootstrapServers string                 `json:"kafka-bootstrap-servers"`
 	KafkaTopicPrefix      string                 `json:"kafka-topic-prefix"`
+	KafkaTopic            string                 `json:"kafka-topic,omitempty"`
 	Tables                []TableConfig          `json:"tables"`
 	KafkaProducerConfig   map[string]interface{} `json:"kafka-producer-config,omitempty"`
 	SnapshotTimestamp     string                 `json:"snapshot-timestamp,omitempty"`

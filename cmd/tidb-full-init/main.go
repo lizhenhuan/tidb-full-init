@@ -26,6 +26,7 @@ var (
 	tablesFlag       string
 	kafkaBootstrap   string
 	kafkaTopicPrefix string
+	kafkaTopic       string
 	parallelism      int
 	startTSO         uint64
 	mockMode         bool
@@ -41,7 +42,8 @@ func init() {
 	flag.StringVar(&database, "database", "test", "Database name")
 	flag.StringVar(&tablesFlag, "tables", "", "Tables to initialize (comma-separated)")
 	flag.StringVar(&kafkaBootstrap, "kafka-bootstrap", "127.0.0.1:9092", "Kafka bootstrap servers")
-	flag.StringVar(&kafkaTopicPrefix, "kafka-topic-prefix", "tidb-data-", "Kafka topic prefix")
+	flag.StringVar(&kafkaTopicPrefix, "kafka-topic-prefix", "tidb-data-", "Kafka topic prefix (topic = prefix + db + '-' + table)")
+	flag.StringVar(&kafkaTopic, "kafka-topic", "", "Kafka topic (fixed; all tables sent to this single topic, overrides -kafka-topic-prefix)")
 	flag.IntVar(&parallelism, "parallelism", 4, "Parallel scan workers per table")
 	flag.Uint64Var(&startTSO, "start-tso", 0, "Start TSO for snapshot scan (0=auto from PD)")
 	flag.BoolVar(&mockMode, "mock", false, "Use mock mode (no real TiKV/Kafka connection)")
@@ -69,8 +71,8 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
-	log.Printf("Config: pd=%s tidb=%s:%s kafka=%s prefix=%s mock=%v user=%s start-tso=%d",
-		cfg.PDAddresses, cfg.TiDBHost, cfg.TiDBPort, cfg.KafkaBootstrapServers, cfg.KafkaTopicPrefix, mockMode, cfg.Username, startTSO)
+	log.Printf("Config: pd=%s tidb=%s:%s kafka=%s prefix=%s topic=%s mock=%v user=%s start-tso=%d",
+		cfg.PDAddresses, cfg.TiDBHost, cfg.TiDBPort, cfg.KafkaBootstrapServers, cfg.KafkaTopicPrefix, cfg.KafkaTopic, mockMode, cfg.Username, startTSO)
 
 	// --- Step 1: Verify TiDB SQL connection BEFORE creating TiKV/Kafka ---
 	var dsn string
@@ -129,7 +131,10 @@ func main() {
 	for _, tc := range cfg.Tables {
 		for _, tableName := range tc.Tables {
 			topic := tc.Topic
-			if topic == "" {
+			if topic == "" && cfg.KafkaTopic != "" {
+				// Fixed Kafka topic: all tables sent to this single topic
+				topic = cfg.KafkaTopic
+			} else if topic == "" {
 				topic = cfg.KafkaTopicPrefix + tc.Database + "-" + tableName
 			}
 
@@ -207,6 +212,7 @@ func buildConfigFromFlags() *config.Config {
 		Password:              password,
 		KafkaBootstrapServers: kafkaBootstrap,
 		KafkaTopicPrefix:      kafkaTopicPrefix,
+		KafkaTopic:            kafkaTopic,
 		Tables: []config.TableConfig{{
 			Database:    database,
 			Tables:      tables,

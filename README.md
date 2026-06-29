@@ -56,6 +56,7 @@ go build -o tidb-verify ./cmd/tidb-verify/
 | `-tables` | string | | 表名，逗号分隔（默认 `orders`） |
 | `-kafka-bootstrap` | string | `127.0.0.1:9092` | Kafka Broker 地址 |
 | `-kafka-topic-prefix` | string | `tidb-data-` | Kafka Topic 前缀（Topic = prefix + db + "-" + table） |
+| `-kafka-topic` | string | | Kafka Topic 全名（固定Topic，所有表数据发送到同一个Topic，设置后覆盖 -kafka-topic-prefix） |
 | `-parallelism` | int | `4` | 每张表的并行扫描协程数 |
 | `-start-tso` | uint64 | `0` | 快照起始 TSO（0=自动从 PD 获取） |
 | `-mock` | bool | `false` | Mock 模式（不连接真实 TiKV/Kafka，用于调试） |
@@ -71,6 +72,7 @@ go build -o tidb-verify ./cmd/tidb-verify/
   "password": "your_password",
   "kafka-bootstrap-servers": "127.0.0.1:9092",
   "kafka-topic-prefix": "tidb-data-",
+  "kafka-topic": "",
   "tables": [
     {
       "database": "mydb",
