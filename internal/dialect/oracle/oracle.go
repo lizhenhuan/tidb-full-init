@@ -13,10 +13,29 @@ import (
 )
 
 // Dialect 实现 dialect.TargetDialect。
-type Dialect struct{}
+type Dialect struct {
+	// maxIdentLen 标识符字节上限（schema/表/列/约束名）。传统 30；
+	// Oracle ≥12.2 支持 128（ddl-sync 按探测版本通过 NewWithIdentLimit
+	// 传入，数据管道默认仍 30，P2 接同一探测）。
+	maxIdentLen int
+}
 
-// New 返回 Oracle 方言实例。
-func New() *Dialect { return &Dialect{} }
+// New 返回 Oracle 方言实例（标识符上限 30，现网口径）。
+func New() *Dialect { return &Dialect{maxIdentLen: DefaultMaxIdentLen} }
+
+// NewWithIdentLimit 按目标 Oracle 版本能力构造（≥12.2 传 128）。
+func NewWithIdentLimit(maxIdent int) *Dialect {
+	if maxIdent <= 0 {
+		maxIdent = DefaultMaxIdentLen
+	}
+	return &Dialect{maxIdentLen: maxIdent}
+}
+
+// DefaultMaxIdentLen Oracle 传统标识符上限（12.2 之前为 30）。
+const DefaultMaxIdentLen = 30
+
+// MaxIdentLen 返回当前生效的标识符上限（ddl-sync 记录进报告供验收首查）。
+func (d *Dialect) MaxIdentLen() int { return d.maxIdentLen }
 
 func (d *Dialect) Name() string { return "oracle" }
 
@@ -31,9 +50,6 @@ type ErrUnsupportedType struct {
 func (e *ErrUnsupportedType) Error() string {
 	return fmt.Sprintf("oracle: unsupported type %q on %s.%s: %s", e.Type, e.Table, e.Column, e.Reason)
 }
-
-// maxIdentifierLen Oracle 传统标识符上限（12.2 之前为 30，保守取 30）。
-const maxIdentifierLen = 30
 
 // oracleReserved 常见 Oracle 保留字（非全集；因所有标识符一律强制加引号，
 // 保留字天然安全，此表仅用于文档化与测试）。
@@ -195,8 +211,8 @@ func (d *Dialect) validateIdentifier(kind, name string) error {
 	if name == "" {
 		return fmt.Errorf("oracle: empty %s identifier", kind)
 	}
-	if len(name) > maxIdentifierLen {
-		return fmt.Errorf("oracle: %s identifier %q exceeds %d bytes (一期拒绝，避免截断冲突)", kind, name, maxIdentifierLen)
+	if len(name) > d.maxIdentLen {
+		return fmt.Errorf("oracle: %s identifier %q exceeds %d bytes (目标版本标识符上限)", kind, name, d.maxIdentLen)
 	}
 	if strings.ContainsAny(name, "\x00") {
 		return fmt.Errorf("oracle: %s identifier %q contains NUL", kind, name)
@@ -234,16 +250,34 @@ func (d *Dialect) ValidateTable(meta model.TableMeta) error {
 	return nil
 }
 
-// pkConstraintName 约束名 "PK_<table>"，超 30 字节时截断并追加短哈希
-// （P1#7：表名 28 字符时约束名会 31 → ORA-00972）。
-func pkConstraintName(table string) string {
-	const limit = 30
+// ValidateIdentifiers 校验 schema/表/列名不超标识符上限（ddl-sync 生成
+// 路径用：与管道 ValidateTable 的标识符检查同口径，但不带 PK/全-PK
+// 约束——DDL 同步允许无 PK 表建结构，数据管道任务创建时另行硬校验）。
+func (d *Dialect) ValidateIdentifiers(schema, table string, columns []string) error {
+	if err := d.validateIdentifier("schema", schema); err != nil {
+		return err
+	}
+	if err := d.validateIdentifier("table", table); err != nil {
+		return err
+	}
+	for _, c := range columns {
+		if err := d.validateIdentifier("column", c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PKConstraintName 约束名 "PK_<table>"，超标识符上限时截断并追加短哈希
+// （P1#7：表名 28 字符时约束名会 31 → ORA-00972；上限随实例化
+// maxIdentLen，30/128 同逻辑）。导出供 ddlsync 复用同一命名口径。
+func (d *Dialect) PKConstraintName(table string) string {
 	name := "PK_" + table
-	if len(name) <= limit {
+	if len(name) <= d.maxIdentLen {
 		return name
 	}
 	sum := fnv32a(table)
-	return name[:limit-4] + fmt.Sprintf("%04X", sum&0xFFFF)
+	return name[:d.maxIdentLen-4] + fmt.Sprintf("%04X", sum&0xFFFF)
 }
 
 func fnv32a(s string) uint32 {
@@ -279,7 +313,7 @@ func (d *Dialect) RenderCreateTable(meta model.TableMeta) (string, error) {
 		pks = append(pks, d.QuoteIdentifier(pk))
 	}
 	fmt.Fprintf(&sb, "  ,CONSTRAINT %s PRIMARY KEY (%s)\n)",
-		d.QuoteIdentifier(pkConstraintName(meta.Table)), strings.Join(pks, ", "))
+		d.QuoteIdentifier(d.PKConstraintName(meta.Table)), strings.Join(pks, ", "))
 	return sb.String(), nil
 }
 
