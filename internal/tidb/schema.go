@@ -1,19 +1,33 @@
 package tidb
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
 	"github.com/lizhenhuan/tidb-full-init/internal/model"
 )
 
+// defaultStatusPort TiDB status 端口默认值（HTTP API，含 /schema/{db}/{table}）。
+const defaultStatusPort = 10080
+
 type SchemaFetcher struct {
 	db *sql.DB
+	// statusURL TiDB status API 基址（http://host:10080）；空 = 无法推导，
+	// 真实列 ID 不可用，回退序号口径（L4）。
+	statusURL string
 }
 
 func NewSchemaFetcher(dsn string) (*SchemaFetcher, error) {
@@ -36,7 +50,7 @@ func NewSchemaFetcher(dsn string) (*SchemaFetcher, error) {
 	}
 	log.Printf("[schema] connected to TiDB %s", version)
 
-	return &SchemaFetcher{db: db}, nil
+	return &SchemaFetcher{db: db, statusURL: statusBaseURL(dsn)}, nil
 }
 
 func (sf *SchemaFetcher) Close() error {
@@ -47,6 +61,17 @@ func (sf *SchemaFetcher) GetTableInfo(database, tableName string) (*encoder.Tabl
 	columns, err := sf.getColumns(database, tableName)
 	if err != nil {
 		return nil, 0, err
+	}
+
+	// L4：用 status API 的真实列 ID 覆盖序号兜底。任一失败不致命——
+	// 回退序号口径，由快照侧 D13 守卫拒绝有 DDL 历史的表（安全网仍在）。
+	idSource := "ordinal(fallback)"
+	if err := sf.applyRealColumnIDs(database, tableName, columns); err != nil {
+		log.Printf("[schema] %s.%s: real column IDs unavailable (%v); "+
+			"falling back to ORDINAL_POSITION as column ID — tables with DROP COLUMN history will be rejected by the snapshot guard (D13)",
+			database, tableName, err)
+	} else {
+		idSource = "real(status API)"
 	}
 
 	tableID, err := sf.getTableID(database, tableName)
@@ -68,8 +93,8 @@ func (sf *SchemaFetcher) GetTableInfo(database, tableName string) (*encoder.Tabl
 		PKNames:  pkNames,
 	}
 
-	log.Printf("[schema] %s.%s: tableID=%d, columns=%d, pk=%v",
-		database, tableName, tableID, len(columns), pkNames)
+	log.Printf("[schema] %s.%s: tableID=%d, columns=%d, pk=%v, column-ids=%s",
+		database, tableName, tableID, len(columns), pkNames, idSource)
 
 	return tableInfo, tableID, nil
 }
@@ -171,6 +196,108 @@ func (sf *SchemaFetcher) getTableID(database, tableName string) (int64, error) {
 		return 0, fmt.Errorf("query table id: %w", err)
 	}
 	return tableID, nil
+}
+
+// statusBaseURL 从 DSN 推导 TiDB status API 基址（默认端口 10080）。
+// 环境变量 TIDB_STATUS_ADDR（如 http://10.0.0.1:10080）可覆盖，DSN 解析
+// 失败返回空串（真实列 ID 随之不可用）。
+func statusBaseURL(dsn string) string {
+	if u := os.Getenv("TIDB_STATUS_ADDR"); u != "" {
+		return u
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil || cfg.Addr == "" {
+		return ""
+	}
+	host := cfg.Addr
+	if h, _, err := net.SplitHostPort(host); err == nil && h != "" {
+		host = h
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(defaultStatusPort))
+}
+
+// statusTableInfo / statusColumnInfo 是 GET /schema/{db}/{table} 返回的
+// table.Info 子集（列名是 CIStr：O=原始大小写，L=小写）。
+type statusColumnInfo struct {
+	ID    int64 `json:"id"`
+	Name  struct {
+		O string `json:"O"`
+		L string `json:"L"`
+	} `json:"name"`
+	State string `json:"state"`
+}
+
+type statusTableInfo struct {
+	Columns []statusColumnInfo `json:"cols"`
+}
+
+// applyRealColumnIDs 用 status API 的真实列 ID 覆盖 columns 里的序号
+// 兜底（L4）：information_schema 不暴露列 ID，序号与真实 ID 在经历过
+// DROP COLUMN / ADD COLUMN 的表上错位，而 rowcodec 解码按列 ID 对齐。
+// 全有或全无：任一列对不上即整体放弃（混合 ID 集会解出脏数据），
+// 调用方回退序号口径并依赖 D13 守卫拒绝危险扫描。
+func (sf *SchemaFetcher) applyRealColumnIDs(database, tableName string, columns []encoder.ColumnInfo) error {
+	if sf.statusURL == "" {
+		return fmt.Errorf("status address unknown")
+	}
+	u := fmt.Sprintf("%s/schema/%s/%s",
+		strings.TrimSuffix(sf.statusURL, "/"), url.PathEscape(database), url.PathEscape(tableName))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("query %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("query %s: %s", u, resp.Status)
+	}
+	var ti statusTableInfo
+	if err := json.NewDecoder(resp.Body).Decode(&ti); err != nil {
+		return fmt.Errorf("decode %s: %w", u, err)
+	}
+
+	byName := make(map[string]int64, len(ti.Columns))
+	for _, c := range ti.Columns {
+		// 只认 public 列（DDL 中间态列不参与解码）。
+		if c.State != "" && !strings.EqualFold(c.State, "public") {
+			continue
+		}
+		name := c.Name.O
+		if name == "" {
+			name = c.Name.L
+		}
+		if name == "" {
+			continue
+		}
+		byName[strings.ToLower(name)] = c.ID
+	}
+	if len(byName) == 0 {
+		return fmt.Errorf("status schema reports no public columns")
+	}
+
+	// 先全部解析成功再一次性写回（中途失败不得留下半覆盖的 ID 集）。
+	seen := make(map[int64]bool, len(columns))
+	ids := make([]int64, len(columns))
+	for i := range columns {
+		id, ok := byName[strings.ToLower(columns[i].Name)]
+		if !ok {
+			return fmt.Errorf("column %s missing in status schema", columns[i].Name)
+		}
+		if seen[id] {
+			return fmt.Errorf("duplicate column id %d from status schema", id)
+		}
+		seen[id] = true
+		ids[i] = id
+	}
+	for i := range columns {
+		columns[i].ID = ids[i]
+	}
+	return nil
 }
 
 func BuildDSN(host, port, user, password string) string {

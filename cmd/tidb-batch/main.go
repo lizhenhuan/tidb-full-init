@@ -101,8 +101,12 @@ type tableResult struct {
 	rows                 int64
 	err                  error
 	stage                string
-	dlqAsserted          bool // expect-dlq 断言已执行（结果记入 err/dlqNote）
-	dlqNote              string
+
+	// expect-dlq 断言结果独立于业务错误（L3）：预期死信会造成预期的
+	// verify DIFF，不能因此掩盖「断言本身通过」这一证据。
+	dlqAsserted bool
+	dlqErr      error
+	dlqNote     string
 }
 
 func main() {
@@ -180,7 +184,7 @@ func main() {
 	for _, k := range keys {
 		r := results[k]
 		status := "FAIL"
-		if r.err == nil && r.fullEqual && (r.incrSkipped || r.incrEqual) {
+		if r.err == nil && r.dlqErr == nil && r.fullEqual && (r.incrSkipped || r.incrEqual) {
 			status = "PASS"
 		} else {
 			exit = 1
@@ -213,6 +217,33 @@ func boolStr(b bool) string {
 	return "DIFF"
 }
 
+// expectDLQTotal 表的预期死信总数（expect-dlq 各 ORA 码之和）。
+func expectDLQTotal(bc *batchCfg, key string) int {
+	total := 0
+	for _, n := range bc.ExpectDLQ[key] {
+		total += n
+	}
+	return total
+}
+
+// reportOK 比对报告判定（L3/K3a）：
+//   - 普通表 = Equal()；
+//   - expect-dlq 表（已知有损）= 行值差异 0、目标无多余、缺失数恰为
+//     预期死信数——即「全部损失可见且仅限于预期损失」。抽样模式下
+//     死信行不一定被抽中，缺失数放宽为 ≤ 预期。
+func reportOK(rep *verify.Report, lossy int, sampled bool) bool {
+	if lossy <= 0 {
+		return rep.Equal()
+	}
+	if rep.RowDiffCount != 0 || rep.ExtraCount != 0 {
+		return false
+	}
+	if sampled {
+		return rep.MissingCount <= int64(lossy)
+	}
+	return rep.MissingCount == int64(lossy)
+}
+
 func containsTable(tables []tableEntry, key string) bool {
 	for _, te := range tables {
 		if te.db+"."+te.table == key {
@@ -228,7 +259,9 @@ func containsTable(tables []tableEntry, key string) bool {
 //  2. 该表死信总行数等于期望之和（多出的未知 reason 也算 FAIL——
 //     「预期内的损失可见」与「没有预期外的损失」都要成立）。
 //
-// 断言失败记入该表 err（汇总 FAIL、退出码 1），不断轮。
+// 断言失败记入该表 dlqErr——独立于业务错误（L3）：预期死信本身会造成
+// 预期的 verify DIFF / 行数缺口，属业务侧已知结果，不得与之混叠，否则
+// 「机器断言通过」这一证据会被掩盖。汇总仍 FAIL、退出码 1，不断轮。
 func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, tables []tableEntry, results map[string]*tableResult) {
 	byKey := make(map[string]tableEntry, len(tables))
 	for _, te := range tables {
@@ -248,11 +281,11 @@ func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, ta
 			if err := ora.QueryRowContext(ctx,
 				`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t AND "reason" LIKE :pat`,
 				sql.Named("t", topic), sql.Named("pat", "%"+code+"%")).Scan(&got); err != nil {
-				r.err = wrapDLQErr(r.err, key, "query %s: %v", code, err)
+				r.dlqErr = wrapDLQErr(r.dlqErr, key, "query %s: %v", code, err)
 				continue
 			}
 			if got != n {
-				r.err = wrapDLQErr(r.err, key, "%s want %d rows, got %d", code, n, got)
+				r.dlqErr = wrapDLQErr(r.dlqErr, key, "%s want %d rows, got %d", code, n, got)
 			}
 			parts = append(parts, fmt.Sprintf("%s:%d", code, got))
 		}
@@ -260,17 +293,18 @@ func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, ta
 		if err := ora.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t`,
 			sql.Named("t", topic)).Scan(&gotTotal); err != nil {
-			r.err = wrapDLQErr(r.err, key, "query total: %v", err)
+			r.dlqErr = wrapDLQErr(r.dlqErr, key, "query total: %v", err)
 			continue
 		}
 		if gotTotal != wantTotal {
-			r.err = wrapDLQErr(r.err, key, "total want %d rows (sum of codes), got %d — unexpected DLQ reasons exist", wantTotal, gotTotal)
+			r.dlqErr = wrapDLQErr(r.dlqErr, key, "total want %d rows (sum of codes), got %d — unexpected DLQ reasons exist", wantTotal, gotTotal)
 		}
-		if r.err == nil {
+		// dlqNote 只反映断言本身（L3）：OK 与否不搭业务错误。
+		if r.dlqErr == nil {
 			sort.Strings(parts)
 			r.dlqNote = fmt.Sprintf("OK(%s)", strings.Join(parts, ","))
 		} else {
-			r.dlqNote = "FAIL"
+			r.dlqNote = fmt.Sprintf("FAIL(%v)", r.dlqErr)
 		}
 	}
 }
@@ -352,7 +386,13 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 	// ---- Step 3: 全量消费到位 → 逐表 verify ----
 	for _, te := range tables {
 		key := te.db + "." + te.table
+		lossy := expectDLQTotal(bc, key)
 		want := fullRes.Tables[key]
+		if lossy > 0 {
+			// 预期死信行不落 Oracle（K3a）：消费到位的行数 = 快照行数
+			// - 预期死信数，否则 count 轮询会空等到超时。
+			want -= int64(lossy)
+		}
 		results[key].rows = want
 		if err := waitConsume(te, want); err != nil {
 			results[key].err = err
@@ -363,8 +403,8 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 			results[key].err = err
 			continue
 		}
-		results[key].fullEqual = rep.Equal()
-		if !rep.Equal() {
+		results[key].fullEqual = reportOK(rep, lossy, bc.Sample > 0)
+		if !results[key].fullEqual {
 			logReport(key, rep)
 		}
 	}
@@ -403,8 +443,11 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 				results[key].err = err
 				continue
 			}
-			results[key].incrEqual = rep.Equal()
-			if !rep.Equal() {
+			// 有损表增量：DLQ 掉的行在源端仍存在，缺失数延续全量口径
+			// （= 预期死信数；抽样 ≤）。注意 dmlgen 随机值可能再次触发同码
+			// 死信，此时轮末 expect-dlq 总数断言会 FAIL——有损表建议 skip 增量。
+			results[key].incrEqual = reportOK(rep, expectDLQTotal(bc, key), bc.Sample > 0)
+			if !results[key].incrEqual {
 				logReport(key+" (incr)", rep)
 			}
 		}
