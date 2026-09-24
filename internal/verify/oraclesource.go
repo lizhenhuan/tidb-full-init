@@ -20,9 +20,9 @@ type OracleConfig struct {
 	Table    string
 }
 
-// OracleSource Oracle 比对源。列类型来自 ALL_TAB_COLUMNS；主键列名沿用
-// 比对对端（源端）——sink 建表保持原列名，因此两端同名。标识符全部按
-// 小写加引号处理（与 oraclesink 建表约定一致）。
+// OracleSource Oracle 比对源。列类型来自 ALL_TAB_COLUMNS（schema/table
+// 大小写不敏感解析出真实 OWNER/TABLE 后按精确名寻址）；主键列名沿用
+// 比对对端（源端）——sink 建表保持原列名，因此两端同名。
 type OracleSource struct {
 	db           *sql.DB
 	schema, table string
@@ -53,21 +53,24 @@ func NewOracleSource(ctx context.Context, cfg OracleConfig, pkNames []string) (*
 func (s *OracleSource) Close() error { return s.db.Close() }
 
 func (s *OracleSource) loadColumns(ctx context.Context) error {
+	// 大小写不敏感解析真实 OWNER/TABLE_NAME（CLI 手输 shop vs SHOP 都能命中），
+	// 后续查询一律用解析出的精确名（复审 P2：避免「小写引号」寻址 0 命中）
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT COLUMN_NAME, DATA_TYPE, DATA_SCALE
+		`SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, DATA_SCALE
 		 FROM ALL_TAB_COLUMNS
-		 WHERE OWNER = :1 AND TABLE_NAME = :2
+		 WHERE UPPER(OWNER) = UPPER(:1) AND UPPER(TABLE_NAME) = UPPER(:2)
 		 ORDER BY COLUMN_ID`, s.schema, s.table)
 	if err != nil {
 		return fmt.Errorf("verify oracle columns: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var name, dataType string
+		var owner, tableName, name, dataType string
 		var scale sql.NullInt64
-		if err := rows.Scan(&name, &dataType, &scale); err != nil {
+		if err := rows.Scan(&owner, &tableName, &name, &dataType, &scale); err != nil {
 			return fmt.Errorf("verify oracle scan: %w", err)
 		}
+		s.schema, s.table = owner, tableName
 		var sp *int
 		if scale.Valid {
 			v := int(scale.Int64)
@@ -79,7 +82,8 @@ func (s *OracleSource) loadColumns(ctx context.Context) error {
 		return fmt.Errorf("verify oracle rows: %w", err)
 	}
 	if len(s.cols) == 0 {
-		return fmt.Errorf("verify: oracle table %s.%s not found or no columns", s.schema, s.table)
+		return fmt.Errorf("verify: oracle table %s.%s not found or no columns "+
+			"(schema/table matched case-insensitively; check spelling and visibility)", s.schema, s.table)
 	}
 	return nil
 }

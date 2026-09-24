@@ -168,7 +168,7 @@ func canonicalTime(v any, layout string) (string, error) {
 	}
 	// 布局中的 .999999999 会自动省略尾零/小数点，抹平秒级以下精度差
 	s := t.Format(layout)
-	// Oracle DATE 承载 MySQL date：时间部分必须恒为 0（映射约定）
+	// KindDate 按映射约定丢弃时间部分（MySQL date ↔ Oracle DATE）
 	return s, nil
 }
 

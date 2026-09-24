@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,17 +122,17 @@ func TestIntegrationTiDBVsOracle(t *testing.T) {
 	defer exec(t, ddlDB, `DROP DATABASE IF EXISTS `+mysqlDB)
 
 	ora := openOracle(t, ctx)
-	oexec(t, ora, fmt.Sprintf(`CREATE USER %s IDENTIFIED BY "pw_%s"`, oraSchema, suffix))
-	defer oexec(t, ora, fmt.Sprintf(`DROP USER %s CASCADE`, oraSchema))
-	oexec(t, ora, fmt.Sprintf(`GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE TO %s`, oraSchema))
-	// 大写建表（简化引号路径；列名与源端同名大写）
-	oexec(t, ora, fmt.Sprintf(`CREATE TABLE %s.%s (
+	oexec(t, ora, fmt.Sprintf(`CREATE USER "%s" IDENTIFIED BY "pw_%s"`, oraSchema, suffix))
+	defer oexec(t, ora, fmt.Sprintf(`DROP USER "%s" CASCADE`, oraSchema))
+	oexec(t, ora, fmt.Sprintf(`GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE TO "%s"`, oraSchema))
+	// 小写加引号建 schema/表（与 oraclesink 生产建表约定一致；OracleSource 亦按小写引号寻址）
+	oexec(t, ora, fmt.Sprintf(`CREATE TABLE "%s"."%s" (
 		ID NUMBER(20,0) PRIMARY KEY,
 		AMOUNT NUMBER(10,2),
 		MEMO VARCHAR2(64),
 		CREATED TIMESTAMP(6))`, oraSchema, tbl))
-	oexec(t, ora, fmt.Sprintf(`INSERT INTO %s.%s VALUES (1, 10.50, 'a', TIMESTAMP '2026-09-24 10:30:05.123456')`, oraSchema, tbl))
-	oexec(t, ora, fmt.Sprintf(`INSERT INTO %s.%s VALUES (2, 20.00, NULL, TIMESTAMP '2026-01-01 00:00:00')`, oraSchema, tbl))
+	oexec(t, ora, fmt.Sprintf(`INSERT INTO "%s"."%s" VALUES (1, 10.50, 'a', TIMESTAMP '2026-09-24 10:30:05.123456')`, oraSchema, tbl))
+	oexec(t, ora, fmt.Sprintf(`INSERT INTO "%s"."%s" VALUES (2, 20.00, NULL, TIMESTAMP '2026-01-01 00:00:00')`, oraSchema, tbl))
 	exec(t, ddlDB, fmt.Sprintf(`INSERT INTO %s.%s VALUES
 		(1, 10.50, 'a', '2026-09-24 10:30:05.123456'),
 		(2, 20.00, NULL, '2026-01-01 00:00:00')`, mysqlDB, tbl))
@@ -162,7 +163,7 @@ func TestIntegrationTiDBVsOracle(t *testing.T) {
 	}
 
 	// 注入差异：Oracle 侧改 amount → 列级定位
-	oexec(t, ora, fmt.Sprintf(`UPDATE %s.%s SET AMOUNT = 99.99 WHERE ID = 1`, oraSchema, tbl))
+	oexec(t, ora, fmt.Sprintf(`UPDATE "%s"."%s" SET AMOUNT = 99.99 WHERE ID = 1`, oraSchema, tbl))
 	dst2, err := NewOracleSource(ctx, OracleConfig{
 		Host: ohost, Port: 1521,
 		Service:  envOr("ORACLE_FREE_SERVICE", "FREEPDB1"),
@@ -181,7 +182,7 @@ func TestIntegrationTiDBVsOracle(t *testing.T) {
 	if rep2.Equal() || rep2.RowDiffCount != 1 {
 		t.Fatalf("oracle-side diff not detected: %+v", rep2)
 	}
-	if d := rep2.RowDiffs[0]; d.PK != "1" || d.Columns[0].Column != "AMOUNT" {
+	if d := rep2.RowDiffs[0]; d.PK != "1" || !strings.EqualFold(d.Columns[0].Column, "amount") {
 		t.Fatalf("diff detail = %+v", d)
 	}
 }
