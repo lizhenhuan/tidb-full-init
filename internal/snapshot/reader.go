@@ -103,6 +103,7 @@ func (r *Reader) scanPartition(
 	var partitionRows int64
 	currentKey := make([]byte, len(start))
 	copy(currentKey, start)
+	validated := false
 
 	for {
 		pairs, err := r.client.ScanWithTS(ctx, currentKey, end, batchSize, startTs)
@@ -112,6 +113,22 @@ func (r *Reader) scanPartition(
 		}
 		if len(pairs) == 0 {
 			break
+		}
+
+		// D13 启动校验：首批数据先验证列 ID 与 schema 一致，防止 DROP COLUMN
+		// 后 ORDINAL_POSITION 与真实列 ID 错位导致静默丢列。
+		if !validated {
+			sample := make([][]byte, 0, len(pairs))
+			for _, pair := range pairs {
+				if isRecordKey(pair.Key) {
+					sample = append(sample, pair.Value)
+				}
+			}
+			if err := ValidateColumnIDs(sample, tableInfo.Columns); err != nil {
+				errCh <- fmt.Errorf("partition %d: %w", partition, err)
+				return
+			}
+			validated = true
 		}
 
 		for _, pair := range pairs {

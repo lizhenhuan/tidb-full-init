@@ -6,8 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	goorav2 "github.com/sijms/go-ora/v2"
 
@@ -60,7 +63,7 @@ func (s *Sink) Prepare(ctx context.Context, meta model.TableMeta) error {
 	}
 	var n int
 	q := "SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = :owner AND TABLE_NAME = :tname"
-	if err := s.db.QueryRowContext(ctx, q, meta.Database, meta.Table).Scan(&n); err != nil {
+	if err := s.db.QueryRowContext(ctx, q, meta.Schema(), meta.Table).Scan(&n); err != nil {
 		return fmt.Errorf("oraclesink check table: %w", err)
 	}
 	if n > 0 {
@@ -77,7 +80,14 @@ func (s *Sink) Prepare(ctx context.Context, meta model.TableMeta) error {
 }
 
 // WriteBatch 单批 = 单 Oracle 事务（D11）。PK 变更的 UPDATE 拆为
-// DELETE(旧 PK) + MERGE(新行)（D2）。返回行级失败分类。
+// DELETE(旧 PK) + MERGE(新行)（D2）。
+//
+// 失败契约（M1.5 P0#1 定稿，与 sink.Sink 接口注释一致）：
+//   - 可重试错误（网络/锁，见 classify）→ 整体回滚，返回 *WriteError{Retryable:true}，
+//     由 applier 退避后重放整批；
+//   - 数据错误（绑定失败/ORA-00001/01722/12899 等）→ 记 RowFailure（Retryable=false，
+//     带 Kafka 坐标与表名，Raw 由 applier 填充）跳过该行，其余行照常提交；
+//   - Applied 只统计随本事务真正提交的行。
 func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []model.RowEvent) (sink.FlushResult, error) {
 	res := sink.FlushResult{}
 	upsertSQL, err := s.d.RenderUpsert(meta)
@@ -91,7 +101,7 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return res, classify(err, "", 0, 0, &res) // 连接级失败全部可重试
+		return res, classify(err) // 连接级失败全部可重试
 	}
 	defer tx.Rollback()
 
@@ -106,39 +116,56 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 	}
 	defer deleteStmt.Close()
 
-	for _, ev := range events {
+	applyOne := func(ev *model.RowEvent) error {
 		// PK 变更：先删旧行（D2）
 		if ev.PKChanged() {
-			oldArgs := bindPKArgs(&ev, true)
+			oldArgs, err := s.bindPKArgs(&meta, ev, true)
+			if err != nil {
+				return dataError(err) // 绑定/转换失败：数据错误，非可重试
+			}
 			if _, err := deleteStmt.ExecContext(ctx, oldArgs...); err != nil {
-				return res, classify(err, ev.Topic, ev.Partition, ev.Offset, &res)
+				return classify(err)
 			}
 		}
 		switch ev.Op {
 		case model.OpDelete:
-			args := bindPKArgs(&ev, false)
+			args, err := s.bindPKArgs(&meta, ev, false)
+			if err != nil {
+				return dataError(err)
+			}
 			if _, err := deleteStmt.ExecContext(ctx, args...); err != nil {
-				return res, classify(err, ev.Topic, ev.Partition, ev.Offset, &res)
+				return classify(err)
 			}
 		case model.OpInsert, model.OpUpdate:
-			args, err := s.bindRowArgs(&meta, &ev)
+			args, err := s.bindRowArgs(&meta, ev)
 			if err != nil {
-				res.Failed = append(res.Failed, sink.RowFailure{
-					Topic: ev.Topic, Partition: ev.Partition, Offset: ev.Offset,
-					Table: meta.Table, Reason: err.Error(), Retryable: false,
-				})
-				continue // 数据错误 → DLQ，不中断整批（行级错误不回滚已写行？
-				// 注：单事务语义下数据错误将回滚整批，由 M2 applier 按
-				// 分类决定整批重试或逐行降级，此处先返回失败明细。
+				return dataError(err)
 			}
 			if _, err := upsertStmt.ExecContext(ctx, args...); err != nil {
-				return res, classify(err, ev.Topic, ev.Partition, ev.Offset, &res)
+				return classify(err)
 			}
+		}
+		return nil
+	}
+
+	for i := range events {
+		if err := applyOne(&events[i]); err != nil {
+			var we *WriteError
+			if errors.As(err, &we) && !we.Retryable {
+				// 数据错误 → 记 RowFailure 跳过该行，其余行照常提交（DLQ）
+				res.Failed = append(res.Failed, sink.RowFailure{
+					Topic: events[i].Topic, Partition: events[i].Partition,
+					Offset: events[i].Offset, Table: meta.Table,
+					Reason: err.Error(), Retryable: false,
+				})
+				continue
+			}
+			return res, err // 可重试 → 整批回滚，交给 applier 重放
 		}
 		res.Applied++
 	}
 	if err := tx.Commit(); err != nil {
-		return res, classify(err, "", 0, 0, &res)
+		return res, classify(err)
 	}
 	return res, nil
 }
@@ -162,25 +189,65 @@ func (s *Sink) bindRowArgs(meta *model.TableMeta, ev *model.RowEvent) ([]any, er
 	return args, nil
 }
 
-func bindPKArgs(ev *model.RowEvent, useOld bool) []any {
+// bindPKArgs 构造 DELETE 的 PK 命名参数，并按列 MySQL 类型做与行写入
+// 一致的显式转换（P0#2：日期类 PK 不能依赖 Oracle 隐式转换）。
+func (s *Sink) bindPKArgs(meta *model.TableMeta, ev *model.RowEvent, useOld bool) ([]any, error) {
 	args := make([]any, 0, len(ev.PKNames))
 	for _, pk := range ev.PKNames {
-		v := ev.After[pk]
+		raw, ok := ev.After[pk]
 		if useOld {
-			if old, ok := ev.Before[pk]; ok {
-				v = old
+			if old, ok2 := ev.Before[pk]; ok2 {
+				raw, ok = old, true
 			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("event missing PK column %q for %s.%s", pk, ev.Database, ev.Table)
+		}
+		v, err := convertValue(pkMySQLType(meta, pk), raw)
+		if err != nil {
+			return nil, err
 		}
 		args = append(args, sql.Named(pk, v))
 	}
-	return args
+	return args, nil
+}
+
+// pkMySQLType 从表元数据取列类型；元数据缺失时返回空串（走字符串绑定）。
+func pkMySQLType(meta *model.TableMeta, col string) string {
+	for _, c := range meta.Columns {
+		if c.Name == col {
+			return c.MySQLType
+		}
+	}
+	return ""
+}
+
+// timeLayouts canal-json 时间字段的候选呈现格式（TiCDC：空格分隔；
+// 兼容 ISO-8601 与纯日期）。
+var timeLayouts = []string{
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02T15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
 }
 
 // convertValue canal-json 字符串呈现 → go-ora 绑定值。
+//
+// NULL 语义（P0#3）：decoder 把 canal-json 的 null 呈现为空串；
+// Oracle 中 ''≡NULL，因此空串统一绑 nil —— 否则 "" 隐式转 NUMBER/TIMESTAMP
+// 会抛 ORA-01722/01861，BLOB/RAW 会绑成 EMPTY_BLOB 而非 NULL。
+//
+// 时间语义（P0#2）：date/datetime/timestamp 显式解析为 time.Time 绑定，
+// 不依赖 session NLS 日期格式（隐式转换受 NLS_DATE_FORMAT 支配会抛
+// ORA-01861/01858）。time 仍按规范串写 VARCHAR2(18)（D4），数值类由
+// Oracle 对规范数字串的隐式转换处理（不受 NLS 影响的形态）。
 func convertValue(mysqlType, raw string) (any, error) {
-	base := strings.ToLower(mysqlType)
+	base := strings.ToLower(strings.TrimSpace(mysqlType))
 	if idx := strings.IndexAny(base, "( "); idx > 0 {
 		base = base[:idx]
+	}
+	if raw == "" {
+		return nil, nil
 	}
 	switch {
 	case strings.HasSuffix(base, "blob") || strings.HasSuffix(base, "binary"):
@@ -189,29 +256,48 @@ func convertValue(mysqlType, raw string) (any, error) {
 			return nil, fmt.Errorf("decode base64 binary value: %w", err)
 		}
 		return b, nil
+	case base == "date" || base == "datetime" || base == "timestamp":
+		for _, layout := range timeLayouts {
+			if t, err := time.Parse(layout, raw); err == nil {
+				return t, nil
+			}
+		}
+		return nil, fmt.Errorf("cannot parse %s value %q (layouts: %v)", mysqlType, raw, timeLayouts)
+	case base == "year":
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse %s value %q: %w", mysqlType, raw, err)
+		}
+		return n, nil
 	default:
-		return raw, nil // 数值/时间由 Oracle 隐式转换，canal 字符串呈现安全
+		return raw, nil
 	}
 }
 
-// classify 依据 ORA- 错误号分类（D11）：
-// 可重试：网络/锁（ORA-12170/00054/00031 等）；
-// 数据错误：ORA-00001 唯一冲突/01722 数字转换/12899 值过宽 等 → DLQ。
-func classify(err error, topic string, partition int, offset int64, res *sink.FlushResult) error {
+// retryableORACodes 暂时性错误的 ORA 码（D11）：网络/锁。
+var retryableORACodes = map[int]bool{
+	12170: true, // 网络超时
+	3113:  true, // 连接断开
+	3114:  true,
+	54:    true, // 资源忙（锁）
+	31:    true, // 死锁标记
+}
+
+// dataError 把本地绑定/转换失败包装为不可重试的 WriteError（数据错误 → DLQ）。
+func dataError(err error) error {
+	return &WriteError{Err: err, Code: 0, Retryable: false}
+}
+
+// classify 依据 ORA- 错误号分类（D11），返回 *WriteError：
+// 仅用于驱动/服务端返回的错误；本地绑定错误用 dataError。
+//   - 可重试：网络/锁（ORA-12170/00054/00031 等）→ applier 整批退避重放；
+//   - 无 ORA 码（code=0）的驱动级错误按暂时性处理（网络层居多），
+//     由 applier 的重试预算兜底防止死循环；
+//   - 数据错误：ORA-00001 唯一冲突/01722 数字转换/12899 值过宽 等
+//     → Retryable=false，WriteBatch 记 RowFailure 跳行（DLQ）。
+func classify(err error) error {
 	code := oraErrorCode(err)
-	retryable := map[int]bool{
-		12170: true, // 网络超时
-		3113:  true, // 连接断开
-		3114:  true,
-		54:    true, // 资源忙（锁）
-		31:    true, // 死锁标记
-	}[code]
-	if res != nil && !retryable {
-		res.Failed = append(res.Failed, sink.RowFailure{
-			Topic: topic, Partition: partition, Offset: offset,
-			Reason: err.Error(), Retryable: false,
-		})
-	}
+	retryable := code == 0 || retryableORACodes[code]
 	return &WriteError{Err: err, Code: code, Retryable: retryable}
 }
 

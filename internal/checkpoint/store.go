@@ -10,9 +10,11 @@ import (
 )
 
 // OffsetStore 权威位点存储。Save 必须在目标端事务提交成功之后调用。
+//
+// 位点语义（M1.5 P1#9 定稿）：offset 一律指"已应用的最后一个 offset"
+// （last applied），消费下一条 = offset+1；无记录返回 -1 表示从头开始。
 type OffsetStore interface {
-	// Load 返回分区已应用的 offset（下一条待消费消息位点）；无记录返回 -1。
-	Load(tp model.TopicPartition) (int64, error)
+	Load(ctx context.Context, tp model.TopicPartition) (int64, error)
 	Save(ctx context.Context, tp model.TopicPartition, offset int64) error
 }
 
@@ -27,7 +29,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{offs: make(map[model.TopicPartition]int64)}
 }
 
-func (s *MemoryStore) Load(tp model.TopicPartition) (int64, error) {
+func (s *MemoryStore) Load(_ context.Context, tp model.TopicPartition) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if off, ok := s.offs[tp]; ok {

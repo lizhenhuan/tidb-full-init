@@ -60,8 +60,19 @@ type DDLEvent struct {
 type TableMeta struct {
 	Database string
 	Table    string
-	Columns  []ColumnMeta
-	PKNames  []string
+	// TargetSchema 目标端 schema/OWNER（P0#4：TiDB 库名 ≠ Oracle 用户是常态，
+	// 由任务级映射配置填充；为空时回落 Database）。
+	TargetSchema string
+	Columns      []ColumnMeta
+	PKNames      []string
+}
+
+// Schema 返回目标端 schema（优先 TargetSchema）。
+func (m *TableMeta) Schema() string {
+	if m.TargetSchema != "" {
+		return m.TargetSchema
+	}
+	return m.Database
 }
 
 // ColumnMeta 列元数据。

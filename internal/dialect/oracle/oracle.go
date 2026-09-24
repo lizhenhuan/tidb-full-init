@@ -68,7 +68,8 @@ func (d *Dialect) QuoteIdentifier(name string) string {
 }
 
 func (d *Dialect) qualified(meta model.TableMeta) string {
-	return d.QuoteIdentifier(meta.Database) + "." + d.QuoteIdentifier(meta.Table)
+	// P0#4：目标 schema 由 TableMeta.Schema() 决定（TargetSchema 优先）。
+	return d.QuoteIdentifier(meta.Schema()) + "." + d.QuoteIdentifier(meta.Table)
 }
 
 // typeRe 解析 MySQL 类型定义：名称 + 可选 (precision[,scale]) + 修饰符。
@@ -118,7 +119,7 @@ func (d *Dialect) MapType(table, column, mysqlType string) (string, error) {
 		return "", err
 	}
 	switch pt.Name {
-	case "bool", "boolean", "serial":
+	case "bool", "boolean":
 		return "NUMBER(3)", nil
 	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
 		prec := oracleNumberPrecision[pt.Name]
@@ -219,6 +220,28 @@ func (d *Dialect) ValidateTable(meta model.TableMeta) error {
 	return nil
 }
 
+// pkConstraintName 约束名 "PK_<table>"，超 30 字节时截断并追加短哈希
+// （P1#7：表名 28 字符时约束名会 31 → ORA-00972）。
+func pkConstraintName(table string) string {
+	const limit = 30
+	name := "PK_" + table
+	if len(name) <= limit {
+		return name
+	}
+	sum := fnv32a(table)
+	return name[:limit-4] + fmt.Sprintf("%04X", sum&0xFFFF)
+}
+
+func fnv32a(s string) uint32 {
+	const prime = 16777619
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime
+	}
+	return h
+}
+
 // RenderCreateTable 生成建表 DDL（设计文档 D5）。
 func (d *Dialect) RenderCreateTable(meta model.TableMeta) (string, error) {
 	if err := d.ValidateTable(meta); err != nil {
@@ -242,7 +265,7 @@ func (d *Dialect) RenderCreateTable(meta model.TableMeta) (string, error) {
 		pks = append(pks, d.QuoteIdentifier(pk))
 	}
 	fmt.Fprintf(&sb, "  ,CONSTRAINT %s PRIMARY KEY (%s)\n)",
-		d.QuoteIdentifier("PK_"+meta.Table), strings.Join(pks, ", "))
+		d.QuoteIdentifier(pkConstraintName(meta.Table)), strings.Join(pks, ", "))
 	return sb.String(), nil
 }
 
@@ -253,6 +276,11 @@ func (d *Dialect) RenderUpsert(meta model.TableMeta) (string, error) {
 		return "", err
 	}
 	target := d.qualified(meta)
+	// P1#8：仅主键列的表无法生成合法的 UPDATE SET，一期明确拒绝。
+	if len(meta.Columns) == len(meta.PKNames) {
+		return "", fmt.Errorf("oracle: table %s.%s contains only PK columns; "+
+			"MERGE upsert requires at least one non-PK column", meta.Schema(), meta.Table)
+	}
 	var src, on, set, cols, vals strings.Builder
 	for i, col := range meta.Columns {
 		c := d.QuoteIdentifier(col.Name)
@@ -305,7 +333,9 @@ func (d *Dialect) RenderAlterTable(meta model.TableMeta, change dialect.SchemaCh
 	return "", dialect.ErrNotImplemented
 }
 
-// Prepare 连接级准备：session NLS 走 utf8（设计文档 D5）。
+// Prepare 连接级准备（设计文档 D5）。一期无实际 session 级设置：
+// 时间类型在 oraclesink 中已显式解析为 time.Time 绑定（M1.5 P0#2），
+// 不依赖 NLS 日期格式；接口保留给 sqlserver/db2 与二期 NLS 兜底。
 func (d *Dialect) Prepare(ctx context.Context) error { return nil }
 
 func isPK(name string, pkNames []string) bool {

@@ -1,4 +1,4 @@
-tidb-full-init
-tidb-verify
+tidb-full-init-kafka
+tidb-verify-kafka
 
 .DS_Store

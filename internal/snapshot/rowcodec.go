@@ -19,6 +19,115 @@ const (
 // rowcodec version byte - if value[0] >= 128, it's the new rowcodec format.
 const rowcodecVer = 128
 
+// ExtractRowColumnIDs 返回一行 rowcodec 值中出现的原始列 ID 集合（新旧格式通吃）。
+// 用于 D13 启动校验：schema 侧以 ORDINAL_POSITION 充当列 ID，若表经历过
+// DROP COLUMN，真实列 ID 与序号错位，解码会静默丢列。
+func ExtractRowColumnIDs(value []byte) map[int64]bool {
+	ids := make(map[int64]bool)
+	if len(value) == 0 {
+		return ids
+	}
+	if IsRowcodecNewFormat(value) {
+		extractNewFormatIDs(value, ids)
+	} else {
+		extractOldFormatIDs(value, ids)
+	}
+	return ids
+}
+
+func extractNewFormatIDs(value []byte, ids map[int64]bool) {
+	if len(value) < 6 {
+		return
+	}
+	flags := value[1]
+	notNullCnt := int(value[2]) | int(value[3])<<8
+	nullCnt := int(value[4]) | int(value[5])<<8
+	isLarge := flags&rowFlagLarge != 0
+
+	pos := 6
+	notNullIDs, n := readColIDs(value[pos:], notNullCnt, isLarge)
+	pos += n
+	nullIDs, _ := readColIDs(value[pos:], nullCnt, isLarge)
+	for _, id := range notNullIDs {
+		ids[id] = true
+	}
+	for _, id := range nullIDs {
+		ids[id] = true
+	}
+}
+
+func extractOldFormatIDs(value []byte, ids map[int64]bool) {
+	pos := 0
+	for pos < len(value) {
+		colID, n := readVarint(value[pos:])
+		if n <= 0 {
+			return
+		}
+		pos += n
+		ids[colID] = true
+		if pos >= len(value) {
+			return
+		}
+		typeFlag := value[pos]
+		pos++
+		switch typeFlag {
+		case 0: // Nil
+		case 1, 6: // Bytes / Decimal (memcomparable)
+			_, n := readMemcomparableBytes(value[pos:])
+			pos += n
+		case 2, 10: // CompactBytes / JSON
+			_, n := readCompactBytes(value[pos:])
+			pos += n
+		case 3, 4: // Int / Uint (memcomparable, 8B)
+			pos += 8
+		case 5: // Float (9B)
+			pos += 9
+		case 7: // Duration (8B)
+			pos += 8
+		case 8: // Varint
+			_, n := readVarint(value[pos:])
+			pos += n
+		case 9: // Uvarint
+			_, n := readUvarint(value[pos:])
+			pos += n
+		default:
+			return
+		}
+	}
+}
+
+// ValidateColumnIDs D13 启动校验：样本行中的原始列 ID 若有任何一个不在
+// schema 列 ID 集合内，说明序号与真实列 ID 错位（典型成因 DROP COLUMN），
+// 必须拒绝执行，避免静默丢列。
+func ValidateColumnIDs(sampleValues [][]byte, columns []encoder.ColumnInfo) error {
+	if len(sampleValues) == 0 {
+		return nil
+	}
+	schemaIDs := make(map[int64]bool, len(columns))
+	for _, col := range columns {
+		schemaIDs[col.ID] = true
+	}
+	unknown := make(map[int64]bool)
+	for _, v := range sampleValues {
+		for id := range ExtractRowColumnIDs(v) {
+			if !schemaIDs[id] {
+				unknown[id] = true
+			}
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(unknown))
+	for id := range unknown {
+		list = append(list, fmt.Sprintf("%d", id))
+	}
+	return fmt.Errorf(
+		"column ID mismatch detected: row data contains column IDs [%s] not present in schema ID set %+v "+
+			"(typically caused by DROP COLUMN; ORDINAL_POSITION cannot be used as column ID). "+
+			"Refusing to scan to avoid silently dropping columns", strings.Join(list, ","), schemaIDs)
+}
+
 // IsRowcodecNewFormat checks if the value uses TiDB's new rowcodec format.
 func IsRowcodecNewFormat(value []byte) bool {
 	return len(value) > 0 && value[0] >= rowcodecVer

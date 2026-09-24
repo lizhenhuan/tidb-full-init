@@ -19,11 +19,17 @@ type Message struct {
 
 // Consumer Kafka 消费者抽象。
 type Consumer interface {
+	// Assign 手动分配分区（D3/D10：一期不用 consumer group 自动 rebalance）。
+	Assign(ctx context.Context, partitions []model.TopicPartition) error
+
 	// Fetch 拉取下一条消息；ctx 取消时返回 ctx.Err()。
 	Fetch(ctx context.Context) (Message, error)
 
 	// Commit best-effort 提交 Kafka offset（仅观测用，非权威位点，D10）。
 	Commit(ctx context.Context, msg Message) error
+
+	// HighWatermark 返回分区高水位，用于观测 lag（D9/D10）。
+	HighWatermark(ctx context.Context, tp model.TopicPartition) (int64, error)
 
 	Close() error
 }

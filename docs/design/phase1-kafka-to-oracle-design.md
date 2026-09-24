@@ -59,7 +59,7 @@ internal/
                 #   实现: oracle/(一期)  预留: sqlserver/ db2/
   checkpoint/   # offset 持久化接口 + SQLite 实现
   verify/       # Verifier 接口(二期实现, 一期只定义)
-  mapping/      # 表/列名映射规则(大小写、保留字、30字符截断策略)
+  mapping/      # (预留) 表/列名映射规则；一期标识符逻辑在 dialect/oracle 内
 web/            # React 前端(前端同学负责)
 ```
 
@@ -100,9 +100,9 @@ web/            # React 前端(前端同学负责)
 | json | CLOB（原文） | |
 | **enum / set** | **一期硬拒绝**（任务创建时校验，报清晰错误） | 现有全量编码为序号/位掩码，写入无意义；二期用 TiDB schema 还原后写 VARCHAR2 |
 
-配套：标识符映射（Oracle 保留字强制引号 + 注入对抗、>30 字符截断规则、大小写策略），集中在 `mapping` 包，含保留字/注入单测。
+配套：标识符映射（Oracle 保留字强制引号 + 注入对抗、**>30 字符一期直接拒绝**（M1.5 review P1#6 定稿：拒绝比截断安全，错误经 UI 透出给用户）、大小写策略）。一期实现集中在 `dialect/oracle` 内（`QuoteIdentifier`/`ValidateTable`），独立 `mapping` 包留待多方言时再抽。
 
-**D5. 目标表准备（一期，schema 以 TiDB 为准）**：任务启动前用 `tidb.SchemaFetcher` 取权威表结构（带 PK，空表也能建），canal-json 的 `mysqlType`/`sqlType` 仅兜底。经 `dialect.RenderCreateTable` 生成 Oracle DDL，页面**预览确认**后执行；Oracle 无 IF NOT EXISTS → 先查 `USER_TABLES` 再 CREATE。运行期 DDL 同步（TiCDC `isDdl` 消息应用）二期做，一期 decoder 识别后跳过并计数。
+**D5. 目标表准备（一期，schema 以 TiDB 为准）**：任务启动前用 `tidb.SchemaFetcher` 取权威表结构（带 PK，空表也能建），canal-json 的 `mysqlType`/`sqlType` 仅兜底。经 `dialect.RenderCreateTable` 生成 Oracle DDL，页面**预览确认**后执行；Oracle 无 IF NOT EXISTS → 先查 `ALL_TABLES`（OWNER=目标 schema，支持 TargetSchema 映射）再 CREATE。运行期 DDL 同步（TiCDC `isDdl` 消息应用）二期做，一期 decoder 识别后跳过并计数。
 
 **D6. 任务持久化用 SQLite**（单文件、零运维）：任务定义/状态、checkpoint offsets、运行指标快照。放 `internal/job/store.go`。
 
@@ -127,9 +127,12 @@ type RowEvent struct {
 }
 type TableMeta struct {
     Database string
-    Table    string
-    Columns  []ColumnMeta
-    PKNames  []string
+    // TargetSchema 目标端 schema/OWNER；TiDB 库名 ≠ Oracle 用户是常态，
+    // 由任务级映射配置填充，为空时回落 Database（M1.5 P0#4）。
+    TargetSchema string
+    Table        string
+    Columns      []ColumnMeta
+    PKNames      []string
 }
 type ColumnMeta struct {
     Name      string
@@ -138,16 +141,31 @@ type ColumnMeta struct {
     IsPK      bool
 }
 
-// internal/sink
+// internal/sink（M1.5 P0#1 定稿失败契约）
 type Sink interface {
     Prepare(ctx context.Context, meta TableMeta) error
     WriteBatch(ctx context.Context, meta TableMeta, events []RowEvent) (FlushResult, error)
     Close() error
 }
 type FlushResult struct {
-    AppliedThrough Offset // 本批应用到的最高位点
-    RowFailures    []RowFailure // 行级失败: 可重试 / DLQ 标记
+    Applied int          // 本事务真正提交的行数（数据错误行跳过不计）
+    Failed  []RowFailure // 行级失败明细
 }
+type RowFailure struct {
+    Topic     string
+    Partition int
+    Offset    int64
+    Table     string
+    Reason    string
+    Raw       []byte // 原始消息体（applier 填充），供 DLQ 落库与前端死信列表展示
+    // Retryable=true 暂时性错误（网络/锁）整批退避重试；
+    // false 数据错误，写 DLQ 并前进 offset
+    Retryable bool
+}
+// WriteBatch 失败契约：
+//   - 可重试错误 → 整体回滚，返回 *WriteError{Retryable:true}，applier 重放整批；
+//   - 数据错误 → 记 RowFailure 跳过该行，其余行照常提交；
+//   - Applied 只统计真正提交的行。
 
 // internal/dialect
 type TargetDialect interface {
@@ -156,22 +174,30 @@ type TargetDialect interface {
     RenderCreateTable(meta TableMeta) (string, error)
     RenderUpsert(meta TableMeta) (string, error)
     RenderDelete(meta TableMeta) (string, error)
+    // 任务创建前的表级校验（一期拒绝 ENUM/SET、无主键、超长标识符等）
+    ValidateTable(meta TableMeta) error
+    // 连接级准备（如 session 字符集），由 sink 打开后调用
+    Prepare(ctx context.Context) error
     // 预留 schema evolution（二期实现，先定义不实现）
     RenderAlterTable(meta TableMeta, change SchemaChange) (string, error)
 }
 
-// internal/consumer
+// internal/consumer（D3/D10：手动分配分区，不用 group rebalance）
 type TopicPartition struct { Topic string; Partition int }
 type Message struct { TopicPartition; Offset int64; Key, Value []byte }
 type Consumer interface {
+    Assign(ctx context.Context, partitions []TopicPartition) error
     Fetch(ctx context.Context) (Message, error)
-    Commit(msg Message) error // best-effort，仅观测用
+    Commit(ctx context.Context, msg Message) error // best-effort，仅观测用
+    HighWatermark(ctx context.Context, tp TopicPartition) (int64, error) // lag 观测
     Close() error
 }
 
 // internal/checkpoint — SQLite 为唯一权威位点
+// 位点语义（M1.5 P1#9 定稿）：offset 一律指"已应用的最后一个 offset"（last applied），
+// 下一条待消费 = offset+1；无记录返回 -1 表示从头开始。
 type OffsetStore interface {
-    Load(tp TopicPartition) (int64, error)
+    Load(ctx context.Context, tp TopicPartition) (int64, error)
     Save(ctx context.Context, tp TopicPartition, offset int64) error
 }
 
@@ -287,7 +313,7 @@ SQL Server / DB2 即新增 `dialect/` 实现 + 驱动接入；DDL 同步即启�
 |---|---|
 | go-ora 成熟度/性能 | M1 先做 array binding 基准测试；不行则评估 godror（需 CGO，最后手段） |
 | canal-json 与 TiCDC 细节差异（时间进制、null 表示、binlog 类型） | decoder golden 测试以 TiCDC 官方样例为准；联调期抓真实消息补充 |
-| Oracle 标识符 30 字符/保留字冲突 | mapping 包统一策略 + 建表预览人工确认 |
+| Oracle 标识符 30 字符/保留字冲突 | 一期直接拒绝 + 建表预览人工确认（constraint 名超长用短哈希） |
 | 单分区 topic 吞吐上限 | 一期表级并行；预留 key-hash 多分区方案 |
 | 大事务/大批次内存 | 批参数上限 + 背压（consumer 逐批处理，不预取爆） |
 | 全量与增量交界重复/乱序 | 幂等 MERGE 天然覆盖；二期校验兜底 |
