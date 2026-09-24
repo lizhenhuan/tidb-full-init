@@ -3,7 +3,14 @@
 package ddlsync
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,6 +159,91 @@ func TestEnumOrSet(t *testing.T) {
 	for _, no := range []string{"varchar(8)", "bigint", "tinyint(1)"} {
 		if enumOrSet(no) {
 			t.Errorf("%s should not be enum/set", no)
+		}
+	}
+}
+
+// ---- #t13 CheckOwnerSchema：假驱动（database/sql/driver 最小实现）----
+
+var (
+	ownerFakeMu    sync.Mutex
+	ownerFakeUsers = map[string]string{} // dsn → 假装的连接用户
+	ownerFakeOnce  sync.Once
+)
+
+func ownerFakeDB(t *testing.T, user string) *sql.DB {
+	t.Helper()
+	ownerFakeMu.Lock()
+	dsn := fmt.Sprintf("ownerfake-%d", len(ownerFakeUsers))
+	ownerFakeUsers[dsn] = user
+	ownerFakeMu.Unlock()
+	ownerFakeOnce.Do(func() {
+		sql.Register("ownerfake", ownerFakeDriver{})
+	})
+	db, err := sql.Open("ownerfake", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+type ownerFakeDriver struct{}
+
+func (ownerFakeDriver) Open(dsn string) (driver.Conn, error) { return ownerFakeConn{dsn}, nil }
+
+type ownerFakeConn struct{ dsn string }
+
+func (ownerFakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not implemented") }
+func (ownerFakeConn) Close() error                        { return nil }
+func (ownerFakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not implemented") }
+
+func (c ownerFakeConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	ownerFakeMu.Lock()
+	user := ownerFakeUsers[c.dsn]
+	ownerFakeMu.Unlock()
+	return &ownerFakeRows{vals: []driver.Value{user}}, nil
+}
+
+type ownerFakeRows struct {
+	vals []driver.Value
+	done bool
+}
+
+func (ownerFakeRows) Columns() []string { return []string{"USER"} }
+func (ownerFakeRows) Close() error      { return nil }
+func (r *ownerFakeRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	copy(dest, r.vals)
+	r.done = true
+	return nil
+}
+
+// TestCheckOwnerSchema #t13 钉子：连接用户与目标 OWNER 一致（大小写
+// 不敏感）放行；不一致必须在任何表执行前整体拒绝，可读错误含双方
+// 名字与后果（索引落连接用户 schema、跨任务撞 ORA-00955）。
+func TestCheckOwnerSchema(t *testing.T) {
+	ctx := context.Background()
+	// 一致：大小写不敏感（Oracle 未加引号标识符缺省大写折叠）
+	for _, tc := range [][2]string{
+		{"DDL_SMOKE", "ddl_smoke"},
+		{"shop", "shop"},
+		{"LZH_PRISMA_MYSQL", "lzh_prisma_mysql"},
+	} {
+		if err := CheckOwnerSchema(ctx, ownerFakeDB(t, tc[0]), tc[1]); err != nil {
+			t.Errorf("user %q vs target %q must pass: %v", tc[0], tc[1], err)
+		}
+	}
+	// 不一致：拒绝 + 可读错误（#t13 现场：system 连、target-schema 另一 OWNER）
+	err := CheckOwnerSchema(ctx, ownerFakeDB(t, "SYSTEM"), "lzh_prisma_mysql")
+	if err == nil {
+		t.Fatal("user/target mismatch must be rejected")
+	}
+	for _, want := range []string{"SYSTEM", "lzh_prisma_mysql", "ORA-00955"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("readable error must mention %q: %v", want, err)
 		}
 	}
 }

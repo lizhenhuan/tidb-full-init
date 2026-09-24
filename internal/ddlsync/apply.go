@@ -97,11 +97,41 @@ func Run(ctx context.Context, tidbDB, oraDB *sql.DB, cfg RunConfig) (*Result, er
 	d := oracle.NewWithIdentLimit(maxIdent)
 	in := NewIntrospector(tidbDB)
 
+	// #t13：未限定的索引名归属「连接用户」schema 而非 targetSchema——
+	// 用户与 OWNER 不一致时表建在目标 schema、索引建在用户 schema（跨
+	// schema 分裂 + 跨任务撞名 ORA-00955）。开工前整体拒绝，不留半途
+	// 状态（dry-run 预检同样适用，只读无副作用）。
+	target := cfg.TargetSchema
+	if target == "" {
+		target = cfg.Database
+	}
+	if err := CheckOwnerSchema(ctx, oraDB, target); err != nil {
+		return nil, err
+	}
+
 	res := &Result{MaxIdent: maxIdent, OracleVer: ver}
 	for _, table := range cfg.Tables {
 		res.Tables = append(res.Tables, syncOne(ctx, in, oraDB, d, cfg, table))
 	}
 	return res, nil
+}
+
+// CheckOwnerSchema 校验 Oracle 连接用户与目标 Schema（OWNER）一致。
+// #t13 决策 (b)：不做 schema 限定索引名（需 CREATE ANY INDEX 提权），
+// 要求以目标 OWNER 用户连接；不一致返回可读错误（大小写不敏感比较，
+// 口径同 Oracle 未加引号标识符的缺省大写折叠）。
+func CheckOwnerSchema(ctx context.Context, oraDB *sql.DB, targetSchema string) error {
+	var user string
+	if err := oraDB.QueryRowContext(ctx, `SELECT USER FROM DUAL`).Scan(&user); err != nil {
+		// 查询自身失败：让后续真正干活的第一条语句去报，不在此拦截
+		return nil
+	}
+	if strings.EqualFold(user, targetSchema) {
+		return nil
+	}
+	return fmt.Errorf(
+		"ddlsync: Oracle 连接用户 %q 与目标 Schema %q 不一致：未限定的索引名会建在连接用户 schema 下（表在目标 schema、索引在用户 schema，跨任务同名索引必撞 ORA-00955）；请用目标 OWNER 用户连接数据源（或把数据源换成 OWNER 账号后重试）",
+		user, targetSchema)
 }
 
 func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dialect, cfg RunConfig, table string) TableResult {
