@@ -121,7 +121,7 @@ var testPartitions = []model.TopicPartition{{Topic: "t.orders", Partition: 0}}
 
 func testMeta(db, table string) (model.TableMeta, error) {
 	if db == "missing" {
-		return model.TableMeta{}, &TableNotFoundError{Database: db, Table: table}
+		return model.TableMeta{}, &model.TableNotFoundError{Database: db, Table: table}
 	}
 	if db == "flaky" { // 模拟 SchemaFetcher 瞬时不可用（非 NotFound）
 		return model.TableMeta{}, fmt.Errorf("dial tcp 10.168.2.232:4000: connect: connection refused")

@@ -2,6 +2,8 @@
 // 单独成包以避免 decoder/sink/dialect 之间的循环依赖。
 package model
 
+import "fmt"
+
 // OpType 事件操作类型。
 type OpType string
 
@@ -87,4 +89,18 @@ type ColumnMeta struct {
 type TopicPartition struct {
 	Topic     string
 	Partition int
+}
+
+// TableNotFoundError 表已从源 schema 删除（schema drift 终态）。
+// 定义在 model 层供 SchemaFetcher（源端）与 applier（管道端）共同引用，
+// 避免包依赖倒置。实现方判定"确认不存在"时返回/包装此类型；
+// 查询失败、超时等瞬时错误不得伪装成 NotFound。applier 语义：
+// 命中 NotFound → 整组 DLQ 并前进 offset；其余 meta 错误 → fatal。
+type TableNotFoundError struct {
+	Database string
+	Table    string
+}
+
+func (e *TableNotFoundError) Error() string {
+	return fmt.Sprintf("table %s.%s not found in source schema", e.Database, e.Table)
 }

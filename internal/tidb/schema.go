@@ -9,6 +9,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
+	"github.com/lizhenhuan/tidb-full-init/internal/model"
 )
 
 type SchemaFetcher struct {
@@ -128,7 +129,20 @@ func (sf *SchemaFetcher) getColumns(database, tableName string) ([]encoder.Colum
 	}
 
 	if len(columns) == 0 {
-		return nil, fmt.Errorf("table %s.%s not found or has no columns", database, tableName)
+		// 区分「表不存在」（schema drift 终态 → *model.TableNotFoundError，
+		// applier 整组 DLQ 并前进 offset）与「表存在但无列」（schema 异常 →
+		// fatal）；查询本身的失败在上面已按普通错误返回（fatal）。
+		var n int
+		if err := sf.db.QueryRow(
+			`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+			 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+			database, tableName).Scan(&n); err != nil {
+			return nil, fmt.Errorf("check table existence %s.%s: %w", database, tableName, err)
+		}
+		if n == 0 {
+			return nil, &model.TableNotFoundError{Database: database, Table: tableName}
+		}
+		return nil, fmt.Errorf("table %s.%s exists but reports no columns (schema anomaly)", database, tableName)
 	}
 
 	return columns, nil

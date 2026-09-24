@@ -55,20 +55,9 @@ func (c *Config) fill() {
 // MetaProvider 返回目标表元数据（TiDB SchemaFetcher 为权威来源，D5）。
 // 错误语义（M2 复审 P1#1）：SchemaFetcher 打 TiDB 是运行期调用，瞬时
 // 不可用属常态，默认一律 fatal（中止、不前进 offset）；只有返回
-// *TableNotFoundError（表已从源删除）才允许整组 DLQ 并前进 offset。
+// *model.TableNotFoundError（表已从源删除）才允许整组 DLQ 并前进 offset。
+// 该类型定义在 model 层，SchemaFetcher 与 applier 共同引用（不倒置依赖）。
 type MetaProvider func(db, table string) (model.TableMeta, error)
-
-// TableNotFoundError 表已从源 schema 删除（schema drift 终态）。
-// 实现方（SchemaFetcher）判定"确认不存在"时返回/包装此类型；
-// 查询失败、超时等瞬时错误不得伪装成 NotFound。
-type TableNotFoundError struct {
-	Database string
-	Table    string
-}
-
-func (e *TableNotFoundError) Error() string {
-	return fmt.Sprintf("table %s.%s not found in source schema", e.Database, e.Table)
-}
 
 // DLQWriter 死信落库（oraclesink.DLQ 实现；测试用内存实现）。
 type DLQWriter interface {
@@ -298,7 +287,7 @@ func (p *Pipeline) flushGroup(ctx context.Context, key string, group []rawEvent)
 		// M2 复审 P1#1：默认 fatal —— SchemaFetcher 打 TiDB 是运行期调用，
 		// 瞬时不可用就把整表事件 DLQ 并越过位点 = 静默丢数据。只有确认
 		// "表已从源删除"（*TableNotFoundError，schema drift 终态）才 DLQ。
-		var nf *TableNotFoundError
+		var nf *model.TableNotFoundError
 		if errors.As(err, &nf) {
 			log.Printf("[applier] WARN table %s dropped from source (%v); %d events to DLQ", key, err, len(group))
 			p.toDLQ(ctx, group, fmt.Sprintf("table dropped from source: %v", err))

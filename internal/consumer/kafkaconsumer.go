@@ -153,7 +153,9 @@ func (c *KafkaConsumer) HighWatermark(ctx context.Context, tp model.TopicPartiti
 	if part[0].Error != nil {
 		return 0, fmt.Errorf("kafkaconsumer list offsets %s/%d: %w", tp.Topic, tp.Partition, part[0].Error)
 	}
-	return part[0].LastOffset + 1, nil // LastOffset=LEO-1（最后一条消息），高水位=LEO
+	// 真库验证（redpanda E2E）：LastOffsetOf（timestamp=-1）返回的
+	// LastOffset 即 LEO/高水位（2 条消息 → 2），不要再 +1。
+	return part[0].LastOffset, nil
 }
 
 // Close 停止所有分区 reader 并释放连接。
