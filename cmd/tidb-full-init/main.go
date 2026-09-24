@@ -1,19 +1,16 @@
+// tidb-full-init：TiKV 快照全量扫描 → canal JSON → Kafka。
+// M3 T3.1 起编排逻辑抽取到 internal/initrunner（供 JobManager 复用），
+// 本文件只剩 flag 解析、config 装配与 log.Fatal 错误出口，行为不变。
 package main
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
-	"os"
 	"strings"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/config"
-	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
-	"github.com/lizhenhuan/tidb-full-init/internal/kafka"
-	"github.com/lizhenhuan/tidb-full-init/internal/snapshot"
-	"github.com/lizhenhuan/tidb-full-init/internal/tidb"
-	"github.com/lizhenhuan/tidb-full-init/internal/tikv"
+	"github.com/lizhenhuan/tidb-full-init/internal/initrunner"
 )
 
 var (
@@ -75,161 +72,17 @@ func main() {
 	log.Printf("Config: pd=%s tidb=%s:%s kafka=%s prefix=%s topic=%s mock=%v user=%s start-tso=%d",
 		cfg.PDAddresses, cfg.TiDBHost, cfg.TiDBPort, cfg.KafkaBootstrapServers, cfg.KafkaTopicPrefix, cfg.KafkaTopic, mockMode, cfg.Username, startTSO)
 
-	// --- Step 1: Verify TiDB SQL connection BEFORE creating TiKV/Kafka ---
-	var dsn string
-	if !mockMode {
-		dsn = tidb.BuildDSN(cfg.TiDBHost, cfg.TiDBPort, cfg.Username, cfg.Password)
-		log.Printf("Verifying TiDB connection at %s:%s ...", cfg.TiDBHost, cfg.TiDBPort)
-		result, err := tidb.VerifyConnection(dsn)
-		if err != nil {
-			log.Fatalf("TiDB connection verification failed: %v", err)
-		}
-		log.Printf("TiDB connected: version=%s, user=%s", result.Version, result.User)
-		for _, g := range result.Grants {
-			log.Printf("  Grant: %s", g)
-		}
-
-		// Verify SELECT access on each target table
-		for _, tc := range cfg.Tables {
-			for _, tableName := range tc.Tables {
-				if err := tidb.VerifyTableAccess(dsn, tc.Database, tableName); err != nil {
-					log.Fatalf("Permission check failed: %v", err)
-				}
-				log.Printf("  SELECT permission verified: %s.%s", tc.Database, tableName)
-			}
-		}
-		log.Println("TiDB authentication and permissions verified successfully")
+	res, err := initrunner.Run(context.Background(), cfg, initrunner.Options{
+		MockMode: mockMode,
+		StartTSO: startTSO,
+	})
+	if err != nil {
+		log.Fatalf("Full init failed: %v", err)
 	}
 
-	// --- Step 2: Create TiKV client (after TiDB verified) ---
-	var tikvClient tikv.Client
-	if mockMode {
-		mockClient := tikv.NewMockClient(nil)
-		tikvClient = mockClient
-		log.Println("Using mock TiKV client")
-	} else {
-		tikvClient, err = tikv.NewTiKVClient(cfg.PDAddresses)
-		if err != nil {
-			log.Fatalf("Create TiKV client: %v", err)
-		}
-		log.Println("Production TiKV client connected")
+	for key, rows := range res.Tables {
+		log.Printf("Result: %s -> %d rows, topic=%s", key, rows, res.Topics[key])
 	}
-	defer tikvClient.Close()
-
-	// --- Step 3: Create SchemaFetcher using verified config ---
-	var schemaFetcher *tidb.SchemaFetcher
-	if !mockMode {
-		schemaFetcher, err = tidb.NewSchemaFetcher(dsn)
-		if err != nil {
-			log.Fatalf("Create schema fetcher: %v", err)
-		}
-		defer schemaFetcher.Close()
-	}
-
-	reader := snapshot.NewReader(tikvClient)
-	ctx := context.Background()
-
-	for _, tc := range cfg.Tables {
-		for _, tableName := range tc.Tables {
-			topic := tc.Topic
-			if topic == "" && cfg.KafkaTopic != "" {
-				// Fixed Kafka topic: all tables sent to this single topic
-				topic = cfg.KafkaTopic
-			} else if topic == "" {
-				topic = cfg.KafkaTopicPrefix + tc.Database + "-" + tableName
-			}
-
-			var kafkaProducer kafka.Producer
-			if mockMode {
-				kafkaProducer = kafka.NewConsoleProducer()
-				log.Printf("Using console producer for topic %s", topic)
-			} else {
-				if err := kafka.EnsureTopic(cfg.KafkaBootstrapServers, topic, 1); err != nil {
-					log.Fatalf("Ensure topic %s: %v", topic, err)
-				}
-				kafkaProducer, err = kafka.NewKafkaProducer(kafka.KafkaProducerConfig{
-					Brokers:     cfg.KafkaBootstrapServers,
-					Topic:       topic,
-					Acks:        1,
-					Compression: "snappy",
-					BatchSize:   100,
-					MaxAttempts: 3,
-				})
-				if err != nil {
-					log.Fatalf("Create Kafka producer: %v", err)
-				}
-				log.Printf("Kafka producer connected to %s, topic=%s", cfg.KafkaBootstrapServers, topic)
-			}
-
-			scanCfg := &snapshot.Config{
-				Database:    tc.Database,
-				TableName:   tableName,
-				Parallelism: tc.Parallelism,
-				BatchSize:   500,
-				StartTSO:    startTSO,
-			}
-
-			var tableInfo *encoder.TableInfo
-			var tableID int64
-
-			if mockMode {
-				tableInfo = buildTableInfo(tc.Database, tableName)
-				tableID = tcTableID(tc.Database, tableName)
-
-				if mc, ok := tikvClient.(*tikv.MockClient); ok {
-					seedMockData(mc, tableID)
-				}
-		} else {
-			tableInfo, tableID, err = schemaFetcher.GetTableInfo(tc.Database, tableName)
-			if err != nil {
-				log.Fatalf("Get table info for %s.%s: %v", tc.Database, tableName, err)
-			}
-		}
-
-		// Check for partitions: partitioned tables store data under partition IDs, not the main tableID.
-		var scanIDs []int64
-		if !mockMode {
-			partIDs, err := schemaFetcher.GetPartitionIDs(tc.Database, tableName)
-			if err != nil {
-				log.Fatalf("Get partition IDs for %s.%s: %v", tc.Database, tableName, err)
-			}
-			if len(partIDs) > 0 {
-				log.Printf("[%s.%s] partitioned table with %d partitions: %v", tc.Database, tableName, len(partIDs), partIDs)
-				scanIDs = partIDs
-			} else {
-				scanIDs = []int64{tableID}
-			}
-		} else {
-			scanIDs = []int64{tableID}
-		}
-
-		var totalRowCount int64
-		for _, scanID := range scanIDs {
-			label := fmt.Sprintf("%s.%s", tc.Database, tableName)
-			if len(scanIDs) > 1 {
-				label = fmt.Sprintf("%s.%s [pid=%d]", tc.Database, tableName, scanID)
-			}
-			log.Printf("Starting: %s (topic=%s)", label, topic)
-
-			rowCount, err := reader.ScanTable(ctx, scanCfg, scanID, tableInfo, kafkaProducer, topic)
-			if err != nil {
-				log.Printf("[%s] ERROR: %v", label, err)
-				kafkaProducer.Close()
-				os.Exit(1)
-			}
-
-			log.Printf("[%s] Done: %d rows -> topic %s", label, rowCount, topic)
-			totalRowCount += rowCount
-		}
-
-		if len(scanIDs) > 1 {
-			log.Printf("[%s.%s] All partitions done: %d total rows -> topic %s", tc.Database, tableName, totalRowCount, topic)
-		}
-			kafkaProducer.Close()
-		}
-	}
-
-	log.Println("All tables initialized successfully")
 }
 
 func buildConfigFromFlags() *config.Config {
@@ -262,82 +115,4 @@ func parseTables(s string) []string {
 		}
 	}
 	return result
-}
-
-// --- Mock mode helpers ---
-
-func tcTableID(database, table string) int64 {
-	var id int64
-	for _, ch := range database + "." + table {
-		id = id*31 + int64(ch)
-	}
-	return id % 10000
-}
-
-func buildTableInfo(database, tableName string) *encoder.TableInfo {
-	return &encoder.TableInfo{
-		Database: database,
-		Table:    tableName,
-		PKNames:  []string{"id"},
-		Columns: []encoder.ColumnInfo{
-			{ID: 1, Name: "id", MySQLType: "int", IsPrimaryKey: true},
-			{ID: 2, Name: "name", MySQLType: "varchar"},
-			{ID: 3, Name: "status", MySQLType: "tinyint"},
-			{ID: 4, Name: "amount", MySQLType: "decimal"},
-			{ID: 5, Name: "created_at", MySQLType: "datetime"},
-		},
-	}
-}
-
-func seedMockData(client *tikv.MockClient, tableID int64) {
-	rows := []string{
-		`{"id":"1","name":"Alice","status":"1","amount":"100.50","created_at":"2026-05-01 10:00:00"}`,
-		`{"id":"2","name":"Bob","status":"0","amount":"250.00","created_at":"2026-05-02 14:30:00"}`,
-		`{"id":"3","name":"Charlie","status":"1","amount":"99.99","created_at":"2026-05-03 09:15:00"}`,
-	}
-
-	for i, row := range rows {
-		key := tikv.GenTableRecordKey(tableID, int64(i+1))
-		value := encolizhenhuanckRow(row)
-		client.SetData(string(key), value)
-	}
-}
-
-func encolizhenhuanckRow(jsonRow string) []byte {
-	values := strings.Split(strings.Trim(jsonRow, "{}"), ",")
-
-	// Build a rowcodec new-format value
-	// Format: VER(1B) | FLAGS(1B) | NOT_NULL_COL_CNT(2B LE) | NULL_COL_CNT(2B LE) |
-	//         NOT_NULL_COL_IDS(1B each) | NOT_NULL_COL_OFFSETS(2B LE each) | COL_DATA
-	ver := byte(128) // rowcodec version
-	flags := byte(0)
-	colCount := len(values)
-
-	var colIDs []byte
-	var colData []byte
-	var offsets []uint32
-
-	for i, entry := range values {
-		kv := strings.SplitN(entry, ":", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
-		colIDs = append(colIDs, byte(i+1))
-		offsets = append(offsets, uint32(len(colData)))
-		colData = append(colData, []byte(val)...)
-	}
-
-	var buf []byte
-	buf = append(buf, ver)
-	buf = append(buf, flags)
-	buf = append(buf, byte(colCount), byte(colCount>>8)) // NOT_NULL_COL_CNT LE
-	buf = append(buf, 0, 0)                              // NULL_COL_CNT LE
-	buf = append(buf, colIDs...)
-	for _, off := range offsets {
-		buf = append(buf, byte(off), byte(off>>8))
-	}
-	buf = append(buf, colData...)
-
-	return buf
 }
