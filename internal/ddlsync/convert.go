@@ -128,6 +128,12 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 			validUKs = append(validUKs, uk)
 		}
 	}
+	// indexedCols：已生效的索引列集（PK + 已生成 UK + 已建二级索引），
+	// UK 去重（ORA-02261）与二级索引去重（ORA-01408）共用。
+	indexedCols := [][]string{}
+	if len(pkNames) > 0 {
+		indexedCols = append(indexedCols, pkNames)
+	}
 	if len(cols) > 0 {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "CREATE TABLE %s (\n", tableName)
@@ -160,6 +166,21 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 				})
 				continue
 			}
+			// ORA-02261（#t14）：内联 UNIQUE 列集与 PK/已生成 UNIQUE 精确
+			// 相同时 Oracle 拒绝（northwind.purchase_orders：PK(id) +
+			// UNIQUE INDEX id(id)，生成器/ORM 常见）——与二级索引的
+			// ORA-01408 去重同族，剔除并记 compat。
+			if dupIndexColumns(uk.Columns, indexedCols) {
+				extra = append(extra, CompatItem{
+					Level:        "table",
+					PreCheckType: PreCheckDataType,
+					SourceValue:  fmt.Sprintf("UNIQUE INDEX %s", uk.Name),
+					TargetValue:  "",
+					Suggest:      "唯一约束列集与主键/已有唯一约束重复，Oracle 拒绝（ORA-02261）；已跳过",
+				})
+				continue
+			}
+			indexedCols = append(indexedCols, uk.Columns)
 			colsUK := make([]string, 0, len(uk.Columns))
 			for _, c := range uk.Columns {
 				colsUK = append(colsUK, d.QuoteIdentifier(nc(c)))
@@ -179,13 +200,7 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 	//   - ORA-01408：列集与 PK/UK/已建索引完全相同的重复索引 Oracle 拒绝，
 	//     跳过并记 compat；
 	//   - ORA-02327：LOB 列不能建 B-tree 索引，跳过并记 compat。
-	indexedCols := [][]string{}
-	if len(pkNames) > 0 {
-		indexedCols = append(indexedCols, pkNames)
-	}
-	for _, uk := range validUKs {
-		indexedCols = append(indexedCols, uk.Columns)
-	}
+	// （indexedCols 已含 PK + 已生成 UK 列集：UK 生成时逐条累积）
 	for _, idx := range meta.Indexes {
 		if anySkipped(idx.Columns, skipped) {
 			continue

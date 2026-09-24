@@ -270,6 +270,49 @@ func TestConvertExpressionIndexCompat(t *testing.T) {
 	}
 }
 
+// TestSkipDuplicateUniqueConstraint #t14 钉子（ORA-02261）：内联 UNIQUE
+// 约束列集与 PK（northwind.purchase_orders：PK(id)+UNIQUE INDEX id(id)）
+// 或已生成 UNIQUE 精确相同时剔除 + compat；被剔除 UK 不再作为二级索引
+// 去重的种子（种子里只有真实生效的约束）。
+func TestSkipDuplicateUniqueConstraint(t *testing.T) {
+	m := goldenMeta() // PK=[id]
+	m.Uniques = []IndexMeta{
+		{Name: "id", Columns: []string{"id"}},             // = PK 列集（#t14 现场）
+		{Name: "order_no", Columns: []string{"order_no"}}, // 正常 UK，保留
+		{Name: "order_no2", Columns: []string{"order_no"}}, // = 已生成 UK 列集
+	}
+	// 二级索引与保留 UK 同列集 → 走 ORA-01408 剔除（种子=已生效约束）
+	m.Indexes = append(m.Indexes, IndexMeta{Name: "idx_order_no", Columns: []string{"order_no"}})
+
+	stmts, extra, err := Convert(m, oracle.NewWithIdentLimit(128), ConvertOptions{TargetSchema: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := joinStatements(stmts)
+	if n := strings.Count(joined, "CONSTRAINT"); n != 2 { // PK + 仅一条 UK
+		t.Fatalf("want exactly PK + 1 UNIQUE constraint, got %d:\n%s", n, joined)
+	}
+	if !strings.Contains(joined, `"UK_orders_order_no"`) || strings.Contains(joined, `"UK_orders_id"`) {
+		t.Fatalf("must keep distinct UK, drop PK-duplicate UK:\n%s", joined)
+	}
+	// compat：2 条 UK 剔除 + 1 条二级索引剔除
+	if len(extra) != 3 {
+		t.Fatalf("want 3 compat items (dup UK×2 + dup idx×1), got %d: %+v", len(extra), extra)
+	}
+	var ukDup, idxDup int
+	for _, it := range extra {
+		if strings.Contains(it.Suggest, "ORA-02261") {
+			ukDup++
+		}
+		if strings.Contains(it.Suggest, "ORA-01408") {
+			idxDup++
+		}
+	}
+	if ukDup != 2 || idxDup != 1 {
+		t.Fatalf("compat breakdown wrong: ukDup=%d idxDup=%d: %+v", ukDup, idxDup, extra)
+	}
+}
+
 // TestIndexConstraintNamesTableQualified P1 钉子（#t12 扫描 ORA-00955/
 // ORA-02264）：Oracle 索引名与约束名 schema 全局，MySQL 表内同名的
 // 索引/UK 跨表必撞——生成名必须纳入表名限定，两表互不相同。
