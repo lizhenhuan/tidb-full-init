@@ -100,6 +100,17 @@ func TestSplitStatementsP22(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("baseline marker: got %#v", got)
 	}
+
+	// 尾部纯注释（用户手编 FixedDDL 常见）不自成语句
+	got = splitStatements("CREATE TABLE t (id NUMBER);\n-- done")
+	if len(got) != 1 {
+		t.Fatalf("trailing comment must not be a statement: %#v", got)
+	}
+	// 多行纯注释块同理
+	got = splitStatements("DROP TABLE t;\n-- a\n-- b;c")
+	if len(got) != 1 {
+		t.Fatalf("comment block must not be a statement: %#v", got)
+	}
 }
 
 func TestDecodeFixedDDL(t *testing.T) {

@@ -121,11 +121,33 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 	compat := CheckCompat(meta, d)
 	r := TableResult{Table: table, TargetTable: target + "." + table, Compat: compat}
 
-	switch {
-	case HasTableCharsetIssue(compat):
+	if HasTableCharsetIssue(compat) {
 		r.Status = StatusSkipped // 表级字符集不兼容：跳过（skipped 两态之一）
 		return r
-	case HasDataTypeIssue(compat):
+	}
+
+	// 目标存在性检查（只读，dry-run 同样执行；先于 Convert——P2-A：
+	// DROP 是否生成必须取决于真实存在性，否则新建表撞 ORA-00942）。
+	// 已存在且非 overwrite → skipped（skipped 两态之二）；已存在且
+	// overwrite → DROP 重建高危标注（设计 §2：报告对被 DROP 表显式标注）。
+	var n int
+	q := `SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = :o AND TABLE_NAME = :t`
+	exists := oraDB.QueryRowContext(ctx, q,
+		sql.Named("o", target), sql.Named("t", table)).Scan(&n) == nil && n > 0
+	dropIfExists := false
+	if exists {
+		if !cfg.Overwrite {
+			r.Status = StatusSkipped
+			r.ErrorCode = "ORA-00955"
+			r.ErrorText = "table already exists in target (overwrite=false)"
+			return r
+		}
+		dropIfExists = true
+		r.Warnings = append(r.Warnings,
+			"已按 overwrite DROP 重建：目标原表（含数据）已被丢弃，本行为不可恢复")
+	}
+
+	if HasDataTypeIssue(compat) {
 		// 列级类型不兼容（ENUM/SET/未知）：failed + compat（FixedDDL 恢复路径）。
 		// failed 仍回传本次生成的 DDL 基线（SkipBadColumns：跳过不兼容列，
 		// 语句头部注释标记，前端 FixedDDL 编辑器据此起稿）。
@@ -133,7 +155,7 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 		r.ErrorText = "column type unsupported by target mapping (see compat items)"
 		if stmts, extra, err := Convert(meta, d, ConvertOptions{
 			NameCase: cfg.NameCase, TargetSchema: cfg.TargetSchema,
-			Overwrite: cfg.Overwrite, SkipBadColumns: true}); err == nil {
+			DropIfExists: dropIfExists, SkipBadColumns: true}); err == nil {
 			r.DDL = joinStatements(stmts)
 			// P3-3：表达式索引等 convert 期 compat 项不随基线丢弃
 			r.Compat = append(r.Compat, extra...)
@@ -142,7 +164,7 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 	}
 
 	stmts, extra, err := Convert(meta, d, ConvertOptions{
-		NameCase: cfg.NameCase, TargetSchema: cfg.TargetSchema, Overwrite: cfg.Overwrite})
+		NameCase: cfg.NameCase, TargetSchema: cfg.TargetSchema, DropIfExists: dropIfExists})
 	r.Compat = append(r.Compat, extra...)
 	if err != nil {
 		r.Status = StatusFailed
@@ -150,24 +172,6 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 		return r
 	}
 	r.DDL = joinStatements(stmts)
-
-	// 目标存在性检查（只读，dry-run 同样执行）：
-	// 已存在且非 overwrite → skipped（skipped 两态之二）；已存在且
-	// overwrite → DROP 重建高危标注（设计 §2：报告对被 DROP 表显式标注）。
-	var n int
-	q := `SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = :o AND TABLE_NAME = :t`
-	exists := oraDB.QueryRowContext(ctx, q,
-		sql.Named("o", target), sql.Named("t", table)).Scan(&n) == nil && n > 0
-	if exists {
-		if !cfg.Overwrite {
-			r.Status = StatusSkipped
-			r.ErrorCode = "ORA-00955"
-			r.ErrorText = "table already exists in target (overwrite=false)"
-			return r
-		}
-		r.Warnings = append(r.Warnings,
-			"已按 overwrite DROP 重建：目标原表（含数据）已被丢弃，本行为不可恢复")
-	}
 
 	if cfg.DryRun {
 		r.Status = StatusSuccess // 可转换（未执行）；dry-run 由报告外层标注
@@ -259,7 +263,7 @@ func splitStatements(sqlText string) []string {
 				i += j
 			}
 		case c == ';':
-			if s := strings.TrimSpace(cur.String()); s != "" {
+			if s := strings.TrimSpace(cur.String()); s != "" && !isCommentOnly(s) {
 				out = append(out, s)
 			}
 			cur.Reset()
@@ -267,10 +271,22 @@ func splitStatements(sqlText string) []string {
 			cur.WriteByte(c)
 		}
 	}
-	if s := strings.TrimSpace(cur.String()); s != "" {
+	if s := strings.TrimSpace(cur.String()); s != "" && !isCommentOnly(s) {
 		out = append(out, s)
 	}
 	return out
+}
+
+// isCommentOnly 纯注释块（所有非空行均为 '--'）不作为语句执行——
+// 用户手编 FixedDDL 常见「…; -- done」尾部注释，自成语句必报错。
+func isCommentOnly(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t != "" && !strings.HasPrefix(t, "--") {
+			return false
+		}
+	}
+	return true
 }
 
 func trunc(s string, n int) string {

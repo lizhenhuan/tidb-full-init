@@ -29,9 +29,12 @@ const (
 
 // ConvertOptions DDL 生成选项。
 type ConvertOptions struct {
-	NameCase  NameCase
+	NameCase     NameCase
 	TargetSchema string // 目标 Oracle OWNER（空 = 源库名）
-	Overwrite bool      // 预置 DROP TABLE（高危：丢目标数据，仅 failed/skipped 重跑路径）
+	// DropIfExists 预置 DROP TABLE。仅当调用方确认目标表确实存在时置真
+	// （P2-A：无条件生成 + 目标不存在 → ORA-00942；Oracle 无 DROP IF
+	// EXISTS，存在性由 syncOne 的 ALL_TABLES 检查决定）。高危：丢目标数据。
+	DropIfExists bool
 	// SkipBadColumns 容忍列级类型不兼容：跳过该列、相关约束/索引一并
 	// 省略，并在语句集头部插入注释标记（供 failed 结果回填 DDL 作为
 	// FixedDDL 编辑器基线，绝不直接执行——调用方只用于展示）。
@@ -109,7 +112,7 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 				strings.Join(names, ", "))})
 	}
 
-	if opts.Overwrite {
+	if opts.DropIfExists {
 		stmts = append(stmts, Statement{Kind: "drop",
 			SQL: fmt.Sprintf("DROP TABLE %s", tableName)})
 	}

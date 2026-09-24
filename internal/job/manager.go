@@ -197,7 +197,7 @@ func (m *Manager) runDdlSync(ctx context.Context, jobID int64, p *DdlSyncPayload
 		for _, t := range res.Tables {
 			row := resultRow(g.Database, t)
 			// 无 PK 表：结构可建，数据任务将被管道拒绝（口径 A warnings）
-			if t.Status == ddlsync.StatusSuccess && !pkSet[t.Table] {
+			if t.Status == ddlsync.StatusSuccess && noPrimaryKey(pkSet, t.Table) {
 				row.Warnings = []string{"无主键：结构已创建，后续全量/增量任务将被管道 ValidateTable 拒绝（已知差异）"}
 			}
 			if err := m.Store.UpsertDDLResult(jobID, &row); err != nil {
@@ -245,8 +245,16 @@ func resultRow(database string, t ddlsync.TableResult) DDLResultRow {
 	return row
 }
 
+// noPrimaryKey 无 PK 判定。nil 集合 = 查询失败 → 一律视为有 PK
+// （P3-B 回归修复：此前 !pkSet[t] 在 nil map 上恒 true，查询瞬时失败
+// 会给整批 success 表误标「无主键」，污染 #t12 语料报告）。
+func noPrimaryKey(pkSet map[string]bool, table string) bool {
+	return pkSet != nil && !pkSet[table]
+}
+
 // fetchPKSet 一批表的主键名集合（P3-2：单查询替代逐表往返；
-// 出错返回 nil = 全部视为有 PK，宁可漏标不误标）。
+// 出错返回 nil = 全部视为有 PK，宁可漏标不误标；成功必返回非 nil
+// map——空集也是有效的「全部无 PK」）。
 func fetchPKSet(ctx context.Context, db *sql.DB, database string, tables []string) map[string]bool {
 	if len(tables) == 0 {
 		return nil

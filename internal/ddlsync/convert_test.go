@@ -93,14 +93,26 @@ func goldenMetaNoUK() *TableMetaFull {
 	return m
 }
 
-func TestConvertOverwriteDropsFirst(t *testing.T) {
+// TestConvertDropOnlyWhenExists P2-A 钉子：DROP 仅由 DropIfExists 决定
+// （存在性检查在 syncOne；无条件 DROP + 目标不存在 → ORA-00942）。
+func TestConvertDropOnlyWhenExists(t *testing.T) {
 	d := oracle.NewWithIdentLimit(30)
-	stmts, _, err := Convert(goldenMeta(), d, ConvertOptions{TargetSchema: "shop", Overwrite: true})
+	stmts, _, err := Convert(goldenMeta(), d, ConvertOptions{TargetSchema: "shop", DropIfExists: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stmts[0].Kind != "drop" || !strings.HasPrefix(stmts[0].SQL, "DROP TABLE \"shop\".\"orders\"") {
-		t.Fatalf("overwrite must prepend DROP, got %+v", stmts[0])
+		t.Fatalf("DropIfExists must prepend DROP, got %+v", stmts[0])
+	}
+	// 目标不存在（DropIfExists=false，syncOne 对新建表的取值）→ 绝无 DROP
+	stmts, _, err = Convert(goldenMeta(), d, ConvertOptions{TargetSchema: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stmts {
+		if s.Kind == "drop" || strings.HasPrefix(s.SQL, "DROP TABLE") {
+			t.Fatalf("new table must not emit DROP (ORA-00942): %+v", s)
+		}
 	}
 }
 

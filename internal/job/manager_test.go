@@ -53,6 +53,20 @@ func TestResultRowQualified(t *testing.T) {
 	}
 }
 
+// TestNoPrimaryKeySemantics P3-B 钉子：nil 集合=查询失败→视为有 PK；
+// 非 nil 空集=有效「全部无 PK」；命中集合=有 PK。
+func TestNoPrimaryKeySemantics(t *testing.T) {
+	if noPrimaryKey(nil, "t") {
+		t.Fatal("nil set (query failed) must be treated as HAS pk — no false warnings")
+	}
+	if !noPrimaryKey(map[string]bool{}, "t") {
+		t.Fatal("empty non-nil set = genuinely no pk")
+	}
+	if noPrimaryKey(map[string]bool{"t": true}, "t") {
+		t.Fatal("table in pk set must have pk")
+	}
+}
+
 // TestRecomputeTerminal 重跑成功后任务终态刷新（冒烟 #2）。
 func TestRecomputeTerminal(t *testing.T) {
 	m := newTestManager(t)
