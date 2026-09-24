@@ -91,6 +91,9 @@ func (sf *SchemaFetcher) GetTableInfo(database, tableName string) (*encoder.Tabl
 		Table:    tableName,
 		Columns:  columns,
 		PKNames:  pkNames,
+		// 真实列 ID 模式（L7）：行数据里的未知列 ID 只可能是被 DROP
+		// COLUMN 的残留，快照侧按跳过处理而非拒绝扫描。
+		RealColumnIDs: idSource == "real(status API)",
 	}
 
 	log.Printf("[schema] %s.%s: tableID=%d, columns=%d, pk=%v, column-ids=%s",

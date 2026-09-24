@@ -137,7 +137,7 @@ func (r *Reader) scanPartition(
 				}
 			}
 			if len(sample) > 0 {
-				if err := ValidateColumnIDs(sample, tableInfo.Columns); err != nil {
+				if err := ValidateColumnIDs(sample, tableInfo.Columns, tableInfo.RealColumnIDs); err != nil {
 					errCh <- fmt.Errorf("partition %d: %w", partition, err)
 					return
 				}

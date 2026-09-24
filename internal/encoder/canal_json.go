@@ -44,6 +44,11 @@ type TableInfo struct {
 	Table    string
 	Columns  []ColumnInfo
 	PKNames  []string
+	// RealColumnIDs 列 ID 来自 TiDB status API 的真实 ID（而非
+	// ORDINAL_POSITION 序号兜底）。此时行数据里的未知列 ID 只可能是
+	// 被 DROP COLUMN 的残留，快照按跳过处理（L7）；序号兜底时保持
+	// D13 严格拒绝（序号错位语义不明，跳过等于静默丢列）。
+	RealColumnIDs bool
 }
 
 func NewInsertMessage(tableInfo *TableInfo) *CanalMessage {
@@ -277,17 +282,20 @@ func FormatValue(mysqlType string, value interface{}) string {
 		}
 		return "0"
 	case time.Time:
+		// L8a：layout 用 .999999（自动省略尾零）——datetime(6)/timestamp(6)
+		// 的微秒不能丢，丢了对端 verify 即假 DIFF（比对侧 canonicalTime
+		// 同样截尾零，两侧口径一致）。
 		if strings.HasPrefix(strings.ToLower(mysqlType), "datetime") ||
 			strings.HasPrefix(strings.ToLower(mysqlType), "timestamp") {
-			return v.Format("2006-01-02 15:04:05")
+			return v.Format("2006-01-02 15:04:05.999999")
 		}
 		if strings.HasPrefix(strings.ToLower(mysqlType), "date") {
 			return v.Format("2006-01-02")
 		}
 		if strings.HasPrefix(strings.ToLower(mysqlType), "time") {
-			return v.Format("15:04:05")
+			return v.Format("15:04:05.999999")
 		}
-		return v.Format("2006-01-02 15:04:05")
+		return v.Format("2006-01-02 15:04:05.999999")
 	default:
 		return fmt.Sprintf("%v", v)
 	}

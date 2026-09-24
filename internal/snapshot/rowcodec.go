@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,7 +101,12 @@ func extractOldFormatIDs(value []byte, ids map[int64]bool) {
 // ValidateColumnIDs D13 启动校验：样本行中的原始列 ID 若有任何一个不在
 // schema 列 ID 集合内，说明序号与真实列 ID 错位（典型成因 DROP COLUMN），
 // 必须拒绝执行，避免静默丢列。
-func ValidateColumnIDs(sampleValues [][]byte, columns []encoder.ColumnInfo) error {
+//
+// realIDs（列 ID 来自 status API 真实值，L7）时语义不同：行数据里的未知
+// 列 ID 只可能是被 DROP COLUMN 的残留值——TiDB 自己读这种行也忽略该列，
+// 跳过即可（告警不拒绝），真实 ID 模式下拒绝会让所有带 DDL 历史的表
+// 永远无法快照。序号兜底模式保持严格拒绝（错位语义不明，跳过=静默丢列）。
+func ValidateColumnIDs(sampleValues [][]byte, columns []encoder.ColumnInfo, realIDs bool) error {
 	if len(sampleValues) == 0 {
 		return nil
 	}
@@ -122,9 +129,14 @@ func ValidateColumnIDs(sampleValues [][]byte, columns []encoder.ColumnInfo) erro
 	for id := range unknown {
 		list = append(list, fmt.Sprintf("%d", id))
 	}
+	if realIDs {
+		log.Printf("[snapshot] row data contains dropped-column remnants (column IDs [%s] not in schema ID set %+v); skipping those columns", strings.Join(list, ","), schemaIDs)
+		return nil
+	}
 	return fmt.Errorf(
 		"column ID mismatch detected: row data contains column IDs [%s] not present in schema ID set %+v "+
-			"(typically caused by DROP COLUMN; ORDINAL_POSITION cannot be used as column ID). "+
+			"(typically caused by DROP COLUMN; ORDINAL_POSITION cannot be used as column ID; "+
+			"real column IDs require the TiDB status API — see TIDB_STATUS_ADDR). "+
 			"Refusing to scan to avoid silently dropping columns", strings.Join(list, ","), schemaIDs)
 }
 
@@ -678,7 +690,9 @@ func decodeTime(data []byte, mt string) string {
 			copy(padded, data)
 			ns = int64(binary.LittleEndian.Uint64(padded))
 		}
-		return formatDuration(ns)
+		// L8a：time(6) 等 fsp>0 的列 MySQL 文本输出恒带小数位（含
+		// ".000000"），verify 侧 TIME 按裸字符串比对，必须逐位一致。
+		return formatDuration(ns, fspOf(mt))
 	}
 	// datetime/timestamp stored as ToPackedUint via rowcodec.encodeUint,
 	// which uses variable-length LITTLE-ENDIAN encoding.
@@ -714,7 +728,17 @@ func decodePackedTime(packed uint64, mt string) string {
 			// Actually, MySQL TIME stores sign in the packed uint: negative if packed > 0x3FFFFFFF
 		}
 		return fmt.Sprintf("%s%02d:%02d:%02d", sign, hour, minute, second)
-	default: // datetime, timestamp
+	case strings.HasPrefix(mt, "timestamp"):
+		// L8b：TIMESTAMP 列 TiDB 行内存的是 UTC 挂钟（读路径由 session
+		// time_zone 换算回显示值）。快照绕过 SQL 层直接读行，必须自己做
+		// UTC→显示时区换算，否则整体偏移时差（实测 -8h 假 DIFF）。换算
+		// 目标取进程本地时区，与驱动 DSN loc=Local 的读出口径一致。
+		t := time.Date(year, time.Month(month), day, hour, minute, second, microsecond*1000, time.UTC).In(time.Local)
+		if microsecond > 0 {
+			return t.Format("2006-01-02 15:04:05.000000")
+		}
+		return t.Format("2006-01-02 15:04:05")
+	default: // datetime
 		if microsecond > 0 {
 			return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d",
 				year, month, day, hour, minute, second, microsecond)
@@ -724,10 +748,29 @@ func decodePackedTime(packed uint64, mt string) string {
 	}
 }
 
-// formatDuration formats nanoseconds (from TiDB KindMysqlDuration) as HH:MM:SS[.uuuuuu].
+// fspOf 从 COLUMN_TYPE（如 "time(6)"、"datetime(3)"）解析小数秒位数；
+// 无精度声明返回 0。
+func fspOf(mt string) int {
+	open := strings.IndexByte(mt, '(')
+	if open < 0 {
+		return 0
+	}
+	end := strings.IndexByte(mt[open:], ')')
+	if end <= 1 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(mt[open+1 : open+end]))
+	if err != nil || n < 0 || n > 6 {
+		return 0
+	}
+	return n
+}
+
+// formatDuration formats nanoseconds (from TiDB KindMysqlDuration) as HH:MM:SS[.ffffff].
 // TiDB stores Duration.Nanoseconds() which is int64 nanoseconds.
 // Negative durations have negative nanoseconds.
-func formatDuration(ns int64) string {
+// fsp>0 时恒输出 fsp 位小数（含全零——MySQL 文本输出口径），截位不进位。
+func formatDuration(ns int64, fsp int) string {
 	neg := ""
 	if ns < 0 {
 		neg = "-"
@@ -738,6 +781,13 @@ func formatDuration(ns int64) string {
 	hours := totalSec / 3600
 	minutes := (totalSec % 3600) / 60
 	seconds := totalSec % 60
+	if fsp > 0 {
+		micros := fmt.Sprintf("%06d", frac/1000)
+		if fsp < 6 {
+			micros = micros[:fsp]
+		}
+		return fmt.Sprintf("%s%02d:%02d:%02d.%s", neg, hours, minutes, seconds, micros)
+	}
 	if frac > 0 {
 		return fmt.Sprintf("%s%02d:%02d:%02d.%06d", neg, hours, minutes, seconds, frac/1000)
 	}
@@ -1026,7 +1076,7 @@ func decodeBinaryJSONArray(val []byte) []byte {
 	result := []byte{'['}
 	for i := 0; i < count; i++ {
 		if i > 0 {
-			result = append(result, ',')
+			result = append(result, ',', ' ') // L8c：对齐 TiDB json String() 的 ", "
 		}
 		off := entriesStart + i*5
 		if off+5 > len(val) {
@@ -1091,7 +1141,10 @@ func decodeBinaryJSONObject(val []byte) []byte {
 	result := []byte{'{'}
 	for i := 0; i < count; i++ {
 		if i > 0 {
-			result = append(result, ',')
+			// L8c：分隔符对齐 TiDB json String()（", " 与 ": "）——驱动
+			// 读出的 JSON 文本带空格，快照侧必须逐字节同口径，否则
+			// verify 裸串比对假 DIFF。
+			result = append(result, ',', ' ')
 		}
 
 		// Read key entry
@@ -1120,7 +1173,7 @@ func decodeBinaryJSONObject(val []byte) []byte {
 		// Write key
 		result = append(result, '"')
 		result = append(result, keyStr...)
-		result = append(result, '"', ':')
+		result = append(result, '"', ':', ' ')
 
 		// Handle literal values (inlined)
 		if vType == jsonTypeCodeLiteral {

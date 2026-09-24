@@ -544,9 +544,38 @@ func isOracleNotFound(err error) bool {
 	return err != nil && strings.Contains(strings.ToUpper(err.Error()), "ORA-00942")
 }
 
+// logReport 打印 DIFF 概要 + 列级样例差异（L8 排查体验：RowDiffs/Missing/
+// Extra 的具体 PK 与列值直接进日志，不用再回数据库手工捞）。
 func logReport(key string, rep *verify.Report) {
 	log.Printf("[batch] DIFF %s: src=%d dst=%d rowDiff=%d missing=%d extra=%d",
 		key, rep.SourceRows, rep.TargetRows, rep.RowDiffCount, rep.MissingCount, rep.ExtraCount)
+	for _, d := range rep.RowDiffs {
+		for _, c := range d.Columns {
+			log.Printf("[batch]   %s pk=%s col=%s: source=%s target=%s",
+				key, verify.FormatPK(d.PK), c.Column, shortVal(c.Source), shortVal(c.Target))
+		}
+	}
+	for i, pk := range rep.MissingInTarget {
+		if i >= 5 {
+			log.Printf("[batch]   %s missing in target: ... (%d more)", key, rep.MissingCount-int64(i))
+			break
+		}
+		log.Printf("[batch]   %s missing in target: pk=%s", key, verify.FormatPK(pk))
+	}
+	for i, pk := range rep.ExtraInTarget {
+		if i >= 5 {
+			log.Printf("[batch]   %s extra in target: ... (%d more)", key, rep.ExtraCount-int64(i))
+			break
+		}
+		log.Printf("[batch]   %s extra in target: pk=%s", key, verify.FormatPK(pk))
+	}
+}
+
+func shortVal(s string) string {
+	if len(s) > 120 {
+		return fmt.Sprintf("%q", s[:120]) + "..."
+	}
+	return fmt.Sprintf("%q", s)
 }
 
 // cleanupOracle 轮末 drop 目标表（保证重跑不残留上次数据）。

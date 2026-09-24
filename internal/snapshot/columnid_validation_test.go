@@ -39,14 +39,14 @@ func TestValidateColumnIDs(t *testing.T) {
 			buildNewFormatRow(0, 1, 2, 3),
 			buildNewFormatRow(0, 1, 3), // Nullable columns may be missing
 		}
-		if err := ValidateColumnIDs(rows, cols); err != nil {
+		if err := ValidateColumnIDs(rows, cols, false); err != nil {
 			t.Fatalf("expect pass, got %v", err)
 		}
 	})
 
-	t.Run("New format has extra ID, rejected", func(t *testing.T) {
+	t.Run("New format has extra ID, rejected in ordinal mode", func(t *testing.T) {
 		rows := [][]byte{buildNewFormatRow(0, 1, 2, 7)}
-		err := ValidateColumnIDs(rows, cols)
+		err := ValidateColumnIDs(rows, cols, false)
 		if err == nil {
 			t.Fatal("expect rejection")
 		}
@@ -57,20 +57,33 @@ func TestValidateColumnIDs(t *testing.T) {
 
 	t.Run("Old format has extra ID, rejected", func(t *testing.T) {
 		rows := [][]byte{buildOldFormatRow(1, 2, 9)}
-		if err := ValidateColumnIDs(rows, cols); err == nil {
+		if err := ValidateColumnIDs(rows, cols, false); err == nil {
 			t.Fatal("expect rejection")
+		}
+	})
+
+	// L7：真实列 ID 模式下，行数据里的未知 ID 只可能是被 DROP COLUMN
+	// 的残留——跳过（告警）而非拒绝，否则带 DDL 历史的表永远无法快照。
+	t.Run("Dropped-column remnant skipped in real-ID mode", func(t *testing.T) {
+		rows := [][]byte{buildNewFormatRow(0, 1, 3, 7)}
+		if err := ValidateColumnIDs(rows, cols, true); err != nil {
+			t.Fatalf("real-ID mode must skip dropped remnants, got %v", err)
+		}
+		old := [][]byte{buildOldFormatRow(1, 3, 9)}
+		if err := ValidateColumnIDs(old, cols, true); err != nil {
+			t.Fatalf("real-ID mode old format must skip too, got %v", err)
 		}
 	})
 
 	t.Run("Old format matches, passes", func(t *testing.T) {
 		rows := [][]byte{buildOldFormatRow(1, 2)}
-		if err := ValidateColumnIDs(rows, cols); err != nil {
+		if err := ValidateColumnIDs(rows, cols, false); err != nil {
 			t.Fatalf("expect pass, got %v", err)
 		}
 	})
 
 	t.Run("Empty sample, passes directly", func(t *testing.T) {
-		if err := ValidateColumnIDs(nil, cols); err != nil {
+		if err := ValidateColumnIDs(nil, cols, false); err != nil {
 			t.Fatalf("expect pass, got %v", err)
 		}
 	})

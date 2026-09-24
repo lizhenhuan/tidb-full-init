@@ -213,4 +213,14 @@ func TestFormatValue(t *testing.T) {
 	if val != "2026-09-24 10:30:00" {
 		t.Errorf("unexpected datetime format: %q", val)
 	}
+
+	// L8a：datetime(6)/timestamp(6) 的微秒不能丢（layout .999999 截尾零）。
+	val = encoder.FormatValue("datetime(6)", time.Date(2026, 9, 24, 10, 30, 5, 123456000, time.UTC))
+	if val != "2026-09-24 10:30:05.123456" {
+		t.Errorf("unexpected datetime(6) format: %q", val)
+	}
+	val = encoder.FormatValue("timestamp(6)", time.Date(2026, 9, 24, 10, 30, 5, 100000000, time.UTC))
+	if val != "2026-09-24 10:30:05.1" {
+		t.Errorf("unexpected timestamp(6) format: %q", val)
+	}
 }
