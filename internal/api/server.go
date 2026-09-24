@@ -317,6 +317,7 @@ func (s *Server) ddlPreview(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		TiDBDatasourceID   string   `json:"tidbDatasourceId"`
 		OracleDatasourceID string   `json:"oracleDatasourceId"`
+		TargetSchema       string   `json:"targetSchema"`
 		Tables             []string `json:"tables"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -394,8 +395,10 @@ func (s *Server) ddlPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]previewRow, 0, len(in.Tables))
 	for _, db := range order {
+		// TargetSchema 透传：预览目标名与实际建表一致（空=源库名，
+		// 冒烟契约确认：POST /jobs 走 payload.targetSchema，两者须同源）
 		res, err := ddlsync.Run(ctx, tidbDB, oraDB, ddlsync.RunConfig{
-			Database: db, Tables: byDB[db], DryRun: true,
+			Database: db, Tables: byDB[db], TargetSchema: in.TargetSchema, DryRun: true,
 		})
 		if err != nil {
 			writeErr(w, 502, fmt.Sprintf("ddlsync %s: %v", db, err))

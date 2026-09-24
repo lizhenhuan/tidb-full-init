@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql" // 注册 mysql 驱动：ConnectTiDB 的 sql.Open("mysql") 依赖（tidb-console 链路此前无包引入）
 	goorav2 "github.com/sijms/go-ora/v2"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/ddlsync"

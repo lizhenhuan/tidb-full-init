@@ -48,7 +48,7 @@ func TestConvertGolden(t *testing.T) {
 			"  \"status\" VARCHAR2(16 CHAR) DEFAULT 'new',\n" +
 			"  \"flag\" NUMBER DEFAULT 5,\n" +
 			"  \"created_at\" TIMESTAMP DEFAULT SYSTIMESTAMP,\n" +
-			"  \"note\" CLOB,\n" +
+			"  \"note\" CLOB\n" +
 			"  ,CONSTRAINT \"PK_orders\" PRIMARY KEY (\"id\")\n" +
 			"  ,CONSTRAINT \"UK_uk_order\" UNIQUE (\"order_no\")\n" +
 			")",
@@ -65,6 +65,32 @@ func TestConvertGolden(t *testing.T) {
 			t.Errorf("stmt #%d:\n got:  %s\n want: %s", i, got[i], want[i])
 		}
 	}
+}
+
+// TestConvertNoDoubleComma 冒烟 Bug2 回归：尾列与约束行之间不得出现
+// 双逗号（NOT NULL,\n  ,CONSTRAINT → ORA-00917）。黄金钉住的旧输出即
+// 错误行为，此测试独立钉住「无 ',\n  ,'」。
+func TestConvertNoDoubleComma(t *testing.T) {
+	d := oracle.NewWithIdentLimit(128)
+	for _, m := range []*TableMetaFull{goldenMeta(), goldenMetaNoUK()} {
+		stmts, _, err := Convert(m, d, ConvertOptions{TargetSchema: "shop"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range stmts {
+			if strings.Contains(s.SQL, ",\n  ,") || strings.Contains(s.SQL, ",\n,") {
+				t.Errorf("double comma in %s:\n%s", m.Table, s.SQL)
+			}
+		}
+	}
+}
+
+// goldenMetaNoUK 无 UK 只有 PK（约束紧跟尾列的另一形态）。
+func goldenMetaNoUK() *TableMetaFull {
+	m := goldenMeta()
+	m.Uniques = nil
+	m.Indexes = nil
+	return m
 }
 
 func TestConvertOverwriteDropsFirst(t *testing.T) {

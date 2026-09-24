@@ -128,7 +128,10 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 		fmt.Fprintf(&sb, "CREATE TABLE %s (\n", tableName)
 		for i, c := range cols {
 			comma := ","
-			if i == len(cols)-1 && len(pkNames) == 0 && len(validUKs) == 0 {
+			// 尾列不带尾逗号：后续约束行自带前导逗号（与管道
+			// RenderCreateTable 同构；冒烟 Bug2：尾逗号+前导逗号=双逗号
+			// ORA-00917）。
+			if i == len(cols)-1 {
 				comma = ""
 			}
 			fmt.Fprintf(&sb, "  %s %s%s%s\n", c.name, c.typ, c.mods, comma)
