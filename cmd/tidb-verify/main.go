@@ -1,7 +1,23 @@
+// tidb-verify：TiDB vs Oracle 一致性比对工具（M2 T2.4，L5 测试基础设施、
+// 二期 Verifier 雏形）。全量 count + 分块 checksum + 逐行逐列 diff，
+// 大表可 -sample 抽样。旧版「canal JSON 导出」已由 tidb-full-init 主 CLI
+// 的快照路径取代，本工具专注比对。
+//
+// 用法示例：
+//
+//	tidb-verify \
+//	  -tidb-dsn 'root:pwd@tcp(10.168.2.232:4000)/' \
+//	  -source lzh_db.orders \
+//	  -oracle-host 127.0.0.1 -oracle-port 1521 -oracle-service FREEPDB1 \
+//	  -oracle-user system -oracle-password pwd \
+//	  -target shop.orders \
+//	  [-chunk-size 1000] [-max-diffs 50] [-sample 1000] [-json]
+//
+// 退出码：0 = 一致；1 = 有差异；2 = 执行错误。
 package main
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,204 +26,144 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-
-	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
+	"github.com/lizhenhuan/tidb-full-init/internal/verify"
 )
-
-var (
-	pdAddress  string
-	database   string
-	tableName  string
-	outputFile string
-	username   string
-	password   string
-)
-
-func init() {
-	flag.StringVar(&pdAddress, "addr", "148.70.194.28:4000", "TiDB address (host:port)")
-	flag.StringVar(&database, "database", "test", "Database name")
-	flag.StringVar(&tableName, "table", "", "Table name (required)")
-	flag.StringVar(&outputFile, "output", "", "Output file path (default: stdout)")
-	flag.StringVar(&username, "username", "root", "TiDB username")
-	flag.StringVar(&password, "password", "", "TiDB password")
-}
 
 func main() {
+	var (
+		tidbDSN     string
+		source      string
+		oraHost     string
+		oraPort     int
+		oraService  string
+		oraUser     string
+		oraPassword string
+		target      string
+		chunkSize   int
+		maxDiffs    int
+		sampleN     int
+		jsonOut     bool
+	)
+	flag.StringVar(&tidbDSN, "tidb-dsn", "", "TiDB DSN（如 root:pwd@tcp(host:4000)/，必填）")
+	flag.StringVar(&source, "source", "", "源表 db.table（必填）")
+	flag.StringVar(&oraHost, "oracle-host", "", "Oracle host（必填）")
+	flag.IntVar(&oraPort, "oracle-port", 1521, "Oracle port")
+	flag.StringVar(&oraService, "oracle-service", "FREEPDB1", "Oracle service name")
+	flag.StringVar(&oraUser, "oracle-user", "system", "Oracle user")
+	flag.StringVar(&oraPassword, "oracle-password", "", "Oracle password（建议环境变量 ORACLE_FREE_PASSWORD 传入）")
+	flag.StringVar(&target, "target", "", "目标 schema.table（必填）")
+	flag.IntVar(&chunkSize, "chunk-size", 1000, "分块 checksum 块大小")
+	flag.IntVar(&maxDiffs, "max-diffs", 50, "行级差异最多展开数")
+	flag.IntVar(&sampleN, "sample", 0, "抽样比对行数（>0 启用抽样模式，大表用）")
+	flag.BoolVar(&jsonOut, "json", false, "JSON 输出报告")
 	flag.Parse()
 
-	if tableName == "" {
-		log.Fatal("-table is required")
+	if oraPassword == "" {
+		oraPassword = os.Getenv("ORACLE_FREE_PASSWORD")
 	}
-
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=true&loc=Local&timeout=5s",
-		username, password, pdAddress, database)
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("Open connection: %v", err)
-	}
-	defer db.Close()
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Ping: %v", err)
-	}
-	log.Printf("Connected to TiDB %s/%s", pdAddress, database)
-
-	columns, err := getTableSchema(db, database, tableName)
-	if err != nil {
-		log.Fatalf("Get schema: %v", err)
-	}
-	log.Printf("Table %s.%s: %d columns", database, tableName, len(columns))
-
-	tableInfo := &encoder.TableInfo{
-		Database: database,
-		Table:    tableName,
-		Columns:  columns,
-	}
-	for _, col := range columns {
-		if col.IsPrimaryKey {
-			tableInfo.PKNames = append(tableInfo.PKNames, col.Name)
+	for k, v := range map[string]string{
+		"-tidb-dsn": tidbDSN, "-source": source, "-oracle-host": oraHost, "-target": target,
+	} {
+		if v == "" {
+			log.Fatalf("%s is required", k)
 		}
 	}
+	srcDB, srcTbl := splitTable(source)
+	dstSchema, dstTbl := splitTable(target)
 
-	rows, err := db.Query(fmt.Sprintf("SELECT * FROM `%s`.`%s`", database, tableName))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	src, err := verify.NewTiDBSource(ctx, verify.TiDBConfig{DSN: tidbDSN, Database: srcDB, Table: srcTbl})
 	if err != nil {
-		log.Fatalf("Query: %v", err)
+		log.Fatalf("source: %v", err)
 	}
-	defer rows.Close()
-
-	colNames, err := rows.Columns()
+	defer src.Close()
+	dst, err := verify.NewOracleSource(ctx, verify.OracleConfig{
+		Host: oraHost, Port: oraPort, Service: oraService,
+		User: oraUser, Password: oraPassword,
+		Schema: dstSchema, Table: dstTbl,
+	}, src.PKNames())
 	if err != nil {
-		log.Fatalf("Get columns: %v", err)
+		log.Fatalf("target: %v", err)
 	}
+	defer dst.Close()
 
-	var writer *os.File
-	if outputFile != "" {
-		writer, err = os.Create(outputFile)
-		if err != nil {
-			log.Fatalf("Create output file: %v", err)
-		}
-		defer writer.Close()
+	var rep *verify.Report
+	if sampleN > 0 {
+		rep, err = verify.Sample(ctx, src, dst, sampleN)
 	} else {
-		writer = os.Stdout
+		rep, err = verify.Compare(ctx, src, dst, verify.Options{ChunkSize: chunkSize, MaxRowDiffs: maxDiffs})
 	}
-
-	count := 0
-
-	for rows.Next() {
-		values := make([]interface{}, len(colNames))
-		valuePtrs := make([]interface{}, len(colNames))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			log.Printf("Scan row error: %v", err)
-			continue
-		}
-
-		rowData := make(map[string]string)
-		for i, col := range colNames {
-			rowData[col] = formatColumnValue(values[i], getMySQLTypeForColumn(columns, col))
-		}
-
-		msg := encoder.NewInsertMessage(tableInfo)
-		msg.BuildTypeMapping(columns)
-		msg.SetRowData(rowData)
-
-		writeJSON(writer, msg)
-		count++
-	}
-
-	log.Printf("Done: %d rows exported for %s.%s", count, database, tableName)
-}
-
-func getTableSchema(db *sql.DB, database, tableName string) ([]encoder.ColumnInfo, error) {
-	rows, err := db.Query(
-		`SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY
-		 FROM INFORMATION_SCHEMA.COLUMNS
-		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-		 ORDER BY ORDINAL_POSITION`, database, tableName)
 	if err != nil {
-		return nil, fmt.Errorf("query columns: %w", err)
-	}
-	defer rows.Close()
-
-	var columns []encoder.ColumnInfo
-	for rows.Next() {
-		var name, dataType, columnType, columnKey string
-		if err := rows.Scan(&name, &dataType, &columnType, &columnKey); err != nil {
-			return nil, fmt.Errorf("scan column: %w", err)
-		}
-		columns = append(columns, encoder.ColumnInfo{
-			Name:         name,
-			MySQLType:    columnType,
-			IsPrimaryKey: columnKey == "PRI",
-			IsUnsigned:   strings.Contains(strings.ToLower(columnType), "unsigned"),
-		})
-	}
-	return columns, rows.Err()
-}
-
-func getMySQLTypeForColumn(columns []encoder.ColumnInfo, colName string) string {
-	for _, c := range columns {
-		if c.Name == colName {
-			return c.MySQLType
-		}
-	}
-	return "varchar"
-}
-
-func formatColumnValue(val interface{}, mysqlType string) string {
-	if val == nil {
-		return ""
+		fmt.Fprintln(os.Stderr, "verify:", err)
+		os.Exit(2)
 	}
 
-	switch v := val.(type) {
-	case []byte:
-		str := string(v)
-		if encoder.IsBinaryType(mysqlType) {
-			return encoder.EncodeBinaryValue(v)
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			log.Fatalf("encode report: %v", err)
 		}
-		return str
-	case time.Time:
-		lower := strings.ToLower(mysqlType)
-		switch {
-		case strings.HasPrefix(lower, "datetime"), strings.HasPrefix(lower, "timestamp"):
-			return v.Format("2006-01-02 15:04:05")
-		case strings.HasPrefix(lower, "date"):
-			return v.Format("2006-01-02")
-		case strings.HasPrefix(lower, "time"):
-			return v.Format("15:04:05")
-		default:
-			return v.Format("2006-01-02 15:04:05")
-		}
-	case int64:
-		return fmt.Sprintf("%d", v)
-	case float64:
-		if strings.Contains(strings.ToLower(mysqlType), "decimal") {
-			return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%f", v), "0"), ".")
-		}
-		return fmt.Sprintf("%v", v)
-	case bool:
-		if v {
-			return "1"
-		}
-		return "0"
-	default:
-		return fmt.Sprintf("%v", v)
+	} else {
+		printReport(rep)
+	}
+
+	if !rep.Equal() {
+		os.Exit(1)
 	}
 }
 
-func writeJSON(w *os.File, msg *encoder.CanalMessage) {
-	data, err := msg.ToJSON()
-	if err != nil {
-		log.Printf("Marshal error: %v", err)
-		return
+func splitTable(s string) (string, string) {
+	parts := strings.SplitN(s, ".", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		log.Fatalf("invalid db.table: %q", s)
 	}
-	fmt.Fprintln(w, string(data))
+	return parts[0], parts[1]
 }
 
-func init() {
-	_ = json.Marshal
+func printReport(r *verify.Report) {
+	fmt.Printf("source rows : %d\ntarget rows : %d\n", r.SourceRows, r.TargetRows)
+	if len(r.Chunks) > 0 {
+		fmt.Printf("chunks      : %d checked, %d mismatched\n", len(r.Chunks), r.ChunksMismatched)
+		for _, c := range r.Chunks {
+			if !c.ChecksumMatch {
+				fmt.Printf("  chunk #%d (rows=%d, checksum=%#x): MISMATCH\n", c.Index, c.Rows, c.SourceChecksum)
+			}
+		}
+	}
+	fmt.Printf("row diffs   : %d\n", r.RowDiffCount)
+	for _, d := range r.RowDiffs {
+		for _, c := range d.Columns {
+			fmt.Printf("  pk=%s col=%s: source=%q target=%q\n",
+				verify.FormatPK(d.PK), c.Column, c.Source, c.Target)
+		}
+	}
+	if r.MissingCount > 0 {
+		fmt.Printf("missing in target: %d (e.g. %s)\n", r.MissingCount,
+			joinPKs(r.MissingInTarget))
+	}
+	if r.ExtraCount > 0 {
+		fmt.Printf("extra in target  : %d (e.g. %s)\n", r.ExtraCount,
+			joinPKs(r.ExtraInTarget))
+	}
+	fmt.Printf("duration    : %s\n", r.Duration)
+	if r.Equal() {
+		fmt.Println("result      : CONSISTENT")
+	} else {
+		fmt.Println("result      : INCONSISTENT")
+	}
+}
+
+func joinPKs(pks []string) string {
+	out := make([]string, 0, len(pks))
+	for _, p := range pks {
+		out = append(out, verify.FormatPK(p))
+	}
+	s := strings.Join(out, ", ")
+	if len(s) > 200 {
+		s = s[:200] + "..."
+	}
+	return s
 }
