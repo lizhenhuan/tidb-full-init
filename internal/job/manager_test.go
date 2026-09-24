@@ -3,6 +3,8 @@ package job
 
 import (
 	"testing"
+
+	"github.com/lizhenhuan/tidb-full-init/internal/ddlsync"
 )
 
 func newTestManager(t *testing.T) *Manager {
@@ -34,6 +36,15 @@ func TestQualifiedTableKey(t *testing.T) {
 	}
 	if len(rows) != 2 {
 		t.Fatalf("same-name tables across dbs collapsed: %d rows", len(rows))
+	}
+}
+
+// TestResultRowQualified 拼装钉子（P3-1：resultRow 必须产出全限定 table，
+// 回退成短名则此处红）。
+func TestResultRowQualified(t *testing.T) {
+	row := resultRow("smoke_b", ddlsync.TableResult{Table: "dup_t", Status: "success"})
+	if row.Table != "smoke_b.dup_t" {
+		t.Fatalf("qualified assembly regressed: %q", row.Table)
 	}
 }
 

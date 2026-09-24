@@ -191,13 +191,13 @@ func (m *Manager) runDdlSync(ctx context.Context, jobID int64, p *DdlSyncPayload
 			fail("ddlsync run %s: %v", g.Database, err)
 			return
 		}
+		// P3-2：PK 集合一组一查（逐表 information_schema 往返在 245 表档
+		// 放大；查询失败按「全部有 PK」处理，不误标）
+		pkSet := fetchPKSet(ctx, tidbDB, g.Database, g.Tables)
 		for _, t := range res.Tables {
-			row := toRow(t)
-			// table_name 存 db.table 全限定（冒烟 #1 正确性：跨库同名表
-			// 在一个 job 内必须唯一；rerun 入参同形）。
-			row.Table = g.Database + "." + t.Table
+			row := resultRow(g.Database, t)
 			// 无 PK 表：结构可建，数据任务将被管道拒绝（口径 A warnings）
-			if t.Status == ddlsync.StatusSuccess && hasNoPK(tidbDB, g.Database, t.Table) {
+			if t.Status == ddlsync.StatusSuccess && !pkSet[t.Table] {
 				row.Warnings = []string{"无主键：结构已创建，后续全量/增量任务将被管道 ValidateTable 拒绝（已知差异）"}
 			}
 			if err := m.Store.UpsertDDLResult(jobID, &row); err != nil {
@@ -235,12 +235,43 @@ func toRow(t ddlsync.TableResult) DDLResultRow {
 	return row
 }
 
-// hasNoPK 源表无主键判定（information_schema，失败按有 PK 处理不误标）。
-func hasNoPK(db *sql.DB, database, table string) bool {
-	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.STATISTICS
-		WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME='PRIMARY'`, database, table).Scan(&n)
-	return err == nil && n == 0
+// resultRow 单表结果 → ddl_results 行。table_name 存 db.table 全限定
+// （冒烟 #1 正确性：跨库同名表在一个 job 内必须唯一；rerun 入参同形）。
+// 独立函数钉住拼装（P3-1：此前内联在 runDdlSync，回退无测试可见）。
+func resultRow(database string, t ddlsync.TableResult) DDLResultRow {
+	row := toRow(t)
+	row.Table = database + "." + t.Table
+	return row
+}
+
+// fetchPKSet 一批表的主键名集合（P3-2：单查询替代逐表往返；
+// 出错返回 nil = 全部视为有 PK，宁可漏标不误标）。
+func fetchPKSet(ctx context.Context, db *sql.DB, database string, tables []string) map[string]bool {
+	if len(tables) == 0 {
+		return nil
+	}
+	ph := make([]string, len(tables))
+	args := make([]any, 0, len(tables)+1)
+	args = append(args, database)
+	for i, t := range tables {
+		ph[i] = "?"
+		args = append(args, t)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT TABLE_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA=? AND INDEX_NAME='PRIMARY' AND TABLE_NAME IN (`+
+		strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	set := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			set[name] = true
+		}
+	}
+	return set
 }
 
 // DdlRerun FixedDDL 重跑（仅 failed 表；fixedDdl base64，空则用原生成 DDL）。

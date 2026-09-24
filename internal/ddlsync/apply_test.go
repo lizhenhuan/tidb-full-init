@@ -71,6 +71,37 @@ func TestSplitStatements(t *testing.T) {
 	}
 }
 
+// TestSplitStatementsP22 P2-2 现场（leader 复现）：注释值里的 ';' 不得
+// 切断语句；'' 转义、'--' 注释里的 ';'、基线头部注释标记同理。
+func TestSplitStatementsP22(t *testing.T) {
+	// leader 复现用例：COMMENT 值含分号
+	in := "CREATE TABLE \"shop\".\"p22\" (\"c\" VARCHAR2(10));\n" +
+		"COMMENT ON COLUMN \"shop\".\"p22\".\"c\" IS 'a;b';"
+	got := splitStatements(in)
+	if len(got) != 2 || !strings.Contains(got[1], "'a;b'") {
+		t.Fatalf("P2-2 leader case: got %#v", got)
+	}
+
+	// '' 转义后跟分号值
+	got = splitStatements("COMMENT ON TABLE t IS 'it''s;fine';\nDROP TABLE t")
+	if len(got) != 2 || !strings.Contains(got[0], "'it''s;fine'") {
+		t.Fatalf("escaped quote: got %#v", got)
+	}
+
+	// '--' 注释含分号：不产生额外语句（注释行随下一条语句整体提交，
+	// Oracle 引擎正确解析前导注释）
+	got = splitStatements("-- skip: a;b;c\nCREATE TABLE t (id NUMBER);")
+	if len(got) != 1 || !strings.Contains(got[0], "CREATE TABLE t (id NUMBER)") {
+		t.Fatalf("line comment: got %#v", got)
+	}
+
+	// 基线头部注释标记 + 正文语句
+	got = splitStatements("-- 以下列因目标类型不兼容被跳过: tags\nCREATE TABLE t (id NUMBER);\nCREATE INDEX i ON t (id);")
+	if len(got) != 2 {
+		t.Fatalf("baseline marker: got %#v", got)
+	}
+}
+
 func TestDecodeFixedDDL(t *testing.T) {
 	// "CREATE TABLE t (id NUMBER);" → base64
 	b64 := "Q1JFQVRFIFRBQkxFIHQgKGlkIE5VTUJFUik7"

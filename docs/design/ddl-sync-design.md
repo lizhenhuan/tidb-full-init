@@ -36,10 +36,10 @@ dialect 扩展：`RenderCreateTableFull`（列默认值/NULL/注释/UK/索引/�
 ## 2. 任务类型与编排
 
 - console `JobType=ddl-sync`；作为 M3 JobManager 骨架落地的**第一个真实任务类型**
-- payload：`{tidbDatasourceId, oracleDatasourceId, targetSchema, tables[], overwrite}`；**overwrite 默认 false**，且只作用于 failed/skipped 表的重跑路径（DROP+CREATE 会丢数据，报告显式标注）
+- payload：`{tidbDatasourceId, oracleDatasourceId, targetSchema, tables[], overwrite}`；**overwrite 默认 false**。**创建期 overwrite 为显式能力（验收 P2-1 定稿，方向 a）**：对已存在表首跑即 DROP+CREATE，语义高危——前端保留 danger 二次确认（Switch + 红 Alert + modal.confirm），API 调用方自行承担；报告/结果对被 DROP 表显式标注
 - 目标 Oracle 版本/extended（12.2）探测并存入 job
 - **标识符上限（review 定稿）**：dialect 参数化 `maxIdentLen`——`New()` 默认 30（现网行为不动），ddlsync 按探测版本 ≥12.2 传 128；`validateIdentifier`/`pkConstraintName`/列名同改。数据管道 P2 接同一探测（#t12 语料含大量 >30 标识符，30 硬拒会让语料大面积不可用）
-- 入口复用 `ValidateTable`（无 PK 拒绝、全 PK 列拒绝、标识符校验）——保证 DDL 产物表可被全量/增量任务直接接管
+- **无 PK / ENUM 入口口径（终裁 A，leader 验收拍板）**：入口只校验标识符与类型映射；无 PK 表可选中、正常建结构，产物行带 `warnings`（"后续全量/增量任务将被管道 `ValidateTable` 拒绝（已知差异）"）；数据管道任务创建时的 `ValidateTable` 硬校验（无 PK / 全 PK 列拒绝）是独立且不重复的守门。ENUM/SET 列级 compat → failed + FixedDDL 恢复路径（§3）
 
 ## 3. API 契约（对齐前端草案 + leader 六点修正）
 
@@ -51,7 +51,7 @@ dialect 扩展：`RenderCreateTableFull`（列默认值/NULL/注释/UK/索引/�
   - `errorCode` = 从执行错误解析 `ORA-\d+`（复用 oraclesink oraErrorCode 口径）
   - `ddl` 在 **failed 时亦必填**（#t10 终评 low 项，P1 已落地）：convert 期列级不兼容的表用 `SkipBadColumns` 模式生成基线——不兼容列跳过、引用该列的 PK/UK/索引/注释剔除、语句头部 `--` 注释标记中断点，供前端 FixedDDL 编辑器起稿（绝不直接执行）
   - `skipped` 仅两态：表已存在且 overwrite=false（ORA-00955）/ 表级 charset 不兼容
-- `POST /jobs/{id}/ddl-rerun`：`{table, fixedDdl?}`——fixedDdl **base64**（TMS 线上语义）；只重跑 failed 表；幂等（重跑前该表按 overwrite 语义处理）
+- `POST /jobs/{id}/ddl-rerun`：`{table, fixedDdl?}`——fixedDdl **base64**（TMS 线上语义）；只重跑 failed 表；`table` 为 `db.table` 全限定（与 `ddlResults.table` 同形）。**切分语义（P2-2 定稿）**：引号/注释感知切分（`'…;…'` 字面量、`''` 转义、`--` 行注释内的 `;` 不切；PL/SQL 匿名块不支持）。语句有序、第 i 条失败即停，错误文本显式标注「第 i/n 条失败（前 i-1 条已生效、部分执行非幂等，重跑前请先清理或改写 DDL）」
 - `POST /oracle/ddl-preview`：**P2 已实现**（`internal/api`，走 DryRun）。契约扩展：body 需带 `tidbDatasourceId`（原契约只有 oracleDatasourceId+tables 无法定位源端）与可选 `targetSchema`（透传 `RunConfig.TargetSchema`，预览目标名与实际建表一致；空=源库名），`tables` 为 `db.table` 全限定名；响应含 `compat[]`（同上结构）
 - `/tidb/schemas`：复用
 

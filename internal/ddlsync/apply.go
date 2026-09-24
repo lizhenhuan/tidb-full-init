@@ -130,10 +130,12 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 		// 语句头部注释标记，前端 FixedDDL 编辑器据此起稿）。
 		r.Status = StatusFailed
 		r.ErrorText = "column type unsupported by target mapping (see compat items)"
-		if stmts, _, err := Convert(meta, d, ConvertOptions{
+		if stmts, extra, err := Convert(meta, d, ConvertOptions{
 			NameCase: cfg.NameCase, TargetSchema: cfg.TargetSchema,
 			Overwrite: cfg.Overwrite, SkipBadColumns: true}); err == nil {
 			r.DDL = joinStatements(stmts)
+			// P3-3：表达式索引等 convert 期 compat 项不随基线丢弃
+			r.Compat = append(r.Compat, extra...)
 		}
 		return r
 	}
@@ -191,10 +193,14 @@ func joinStatements(stmts []Statement) string {
 
 // ApplyFixedDDL 重跑单表：base64(UTF-8) DDL 按分号拆分逐条执行。
 // 语义对齐 TMS 线上（structure_service 先 decode 再 Exec）。
+// 语句有序：第 i 条失败即停，错误显式标注「已生效 i 条」（P2-2 现场
+// 复现：部分生效 + 非幂等，下次重跑撞 ORA-00955——结果必须可见）。
 func ApplyFixedDDL(ctx context.Context, oraDB *sql.DB, sqlText string) error {
-	for _, stmt := range splitStatements(sqlText) {
+	stmts := splitStatements(sqlText)
+	for i, stmt := range stmts {
 		if _, err := oraDB.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("ddlsync: fixed ddl %q…: %w", trunc(stmt, 60), err)
+			return fmt.Errorf("ddlsync: fixed ddl 第 %d/%d 条失败（前 %d 条已生效、部分执行非幂等，重跑前请先清理或改写 DDL）%q…: %w",
+				i+1, len(stmts), i, trunc(stmt, 60), err)
 		}
 	}
 	return nil
@@ -212,12 +218,51 @@ func DecodeFixedDDL(b64 string) (string, error) {
 	return string(b), nil
 }
 
+// splitStatements 引号/注释感知切分（P2-2：裸 ';' 会切坏字符串字面量、
+// COMMENT ON 文本与 '--' 注释里的分号 → ORA-01756）。规则：单引号字符串
+// 内（含 '' 转义）不切；'--' 行注释吞到行尾；仅引号外的 ';' 是语句边界。
+// PL/SQL 匿名块不支持——FixedDDL 编辑器是 DDL 语句序列，不设 BEGIN/END
+// 嵌套状态（如需，二期加 /* */ 块注释感知）。
 func splitStatements(sqlText string) []string {
 	var out []string
-	for _, s := range strings.Split(sqlText, ";") {
-		if strings.TrimSpace(s) != "" {
-			out = append(out, s)
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(sqlText); i++ {
+		c := sqlText[i]
+		switch {
+		case inQuote:
+			cur.WriteByte(c)
+			if c == '\'' {
+				if i+1 < len(sqlText) && sqlText[i+1] == '\'' { // '' 转义
+					cur.WriteByte(sqlText[i+1])
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+		case c == '\'':
+			inQuote = true
+			cur.WriteByte(c)
+		case c == '-' && i+1 < len(sqlText) && sqlText[i+1] == '-':
+			j := strings.IndexByte(sqlText[i:], '\n')
+			if j < 0 {
+				cur.WriteString(sqlText[i:])
+				i = len(sqlText)
+			} else {
+				cur.WriteString(sqlText[i : i+j+1])
+				i += j
+			}
+		case c == ';':
+			if s := strings.TrimSpace(cur.String()); s != "" {
+				out = append(out, s)
+			}
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
 		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
 	}
 	return out
 }
