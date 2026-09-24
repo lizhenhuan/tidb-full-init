@@ -187,6 +187,19 @@ func (p *Pipeline) Run(ctx context.Context, partitions []model.TopicPartition) e
 		return flushWith(fctx)
 	}
 
+	// flushOrGraceful 运行期冲刷；若恰在退出瞬间命中已取消的 run ctx
+	// （ticker 与 cancel 竞态），改走优雅冲刷而不是把 context canceled
+	// 当致命错误上抛——位点语义不变：仍只在写入成功后前进。
+	flushOrGraceful := func() error {
+		if err := flush(); err != nil {
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				return gracefulFlush()
+			}
+			return err
+		}
+		return nil
+	}
+
 	// fetchPoll 限制单次 Fetch 阻塞时长：Consumer.Fetch 无法感知 flush
 	// ticker，若无限阻塞会在低流量时饿死攒批窗口的定时冲刷。
 	fetchPoll := p.cfg.FlushInterval / 4
@@ -200,7 +213,7 @@ func (p *Pipeline) Run(ctx context.Context, partitions []model.TopicPartition) e
 		case <-ctx.Done():
 			return gracefulFlush() // 优雅退出：先冲刷已攒窗口
 		case <-flushTicker.C:
-			if err := flush(); err != nil {
+			if err := flushOrGraceful(); err != nil {
 				return err
 			}
 			continue
@@ -236,7 +249,7 @@ func (p *Pipeline) Run(ctx context.Context, partitions []model.TopicPartition) e
 				Reason: "decode failed: " + derr.Error(), Raw: msg.Value, Retryable: false,
 			}})
 			if len(window) >= p.cfg.BatchSize {
-				if err := flush(); err != nil {
+				if err := flushOrGraceful(); err != nil {
 					return err
 				}
 			}
@@ -254,7 +267,7 @@ func (p *Pipeline) Run(ctx context.Context, partitions []model.TopicPartition) e
 		}
 
 		if len(window) >= p.cfg.BatchSize {
-			if err := flush(); err != nil {
+			if err := flushOrGraceful(); err != nil {
 				return err
 			}
 		}

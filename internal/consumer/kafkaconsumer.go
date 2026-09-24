@@ -9,8 +9,10 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 
@@ -90,6 +92,10 @@ func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPart
 			Partition: tp.Partition,
 			MinBytes:  c.cfg.MinBytes,
 			MaxBytes:  c.cfg.MaxBytes,
+			// 长轮询上限：kafka-go 把它同时设为底层连接读超时，默认 10s
+			// 会让 Close（Reader.join.Wait 等在途 batch read）最坏阻塞
+			// 10s（#t6 E2E 实测）。压到 1s：空闲时多一次往返，关停有界。
+			MaxWait: 1 * time.Second,
 			// 位点越界（Kafka retention 截断越过 SQLite last-applied =
 			// 数据丢失场景）不静默重试等待，直接报错上抛（fail loud）。
 			OffsetOutOfRangeError: true,
@@ -105,12 +111,22 @@ func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPart
 		go func(rd *kafka.Reader) {
 			defer c.wg.Done()
 			for {
-				m, err := rd.FetchMessage(runCtx)
+				// 泵的 fetch 必须带 deadline：kafka-go 只在 ctx 带 deadline 时
+				// 给底层连接设读超时；cancelable-无 deadline 的 ctx 会让
+				// ReadBatchWith 无限期阻塞在 Peek —— broker 存活但无数据时
+				// Reader.Close 的 wg.Wait 永远等不回来（#t6 E2E 实测挂死）。
+				fctx, fcancel := context.WithTimeout(runCtx, 5*time.Second)
+				m, err := rd.FetchMessage(fctx)
+				fcancel()
 				if err != nil {
 					// Close 先 cancel 再关 reader，此时 runCtx 已取消，
 					// 关停引发的错误不外抛
 					if runCtx.Err() != nil {
 						return
+					}
+					// 长轮询空闲超时：放弃本次 fetch 重新发起，不是泵死亡
+					if errors.Is(err, context.DeadlineExceeded) {
+						continue
 					}
 					// 致命泵错误（OffsetOutOfRange/认证/未知分区等）：
 					// 上抛给 Fetch → Run fail loud。绝不能静默退出——
