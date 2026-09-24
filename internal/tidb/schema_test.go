@@ -1,11 +1,12 @@
 package tidb
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/model"
 )
@@ -26,9 +27,9 @@ func TestIntegrationSchemaFetcherNotFound(t *testing.T) {
 	}
 	defer sf.Close()
 
-	ctx := context.Background()
-	_ = ctx
-	const db, tbl = "e2e_schema_test", "orders"
+	// 随机后缀防两个 agent 在共享 TiDB 上并发互踩（M2 收口复审 P2#2）
+	db := "e2e_schema_test_" + fmt.Sprintf("%d%d", time.Now().UnixNano()%1e6, os.Getpid()%1000)
+	const tbl = "orders"
 	mustExec := func(q string) {
 		t.Helper()
 		if _, err := sf.db.Exec(q); err != nil {

@@ -129,9 +129,21 @@ func (sf *SchemaFetcher) getColumns(database, tableName string) ([]encoder.Colum
 	}
 
 	if len(columns) == 0 {
-		// 区分「表不存在」（schema drift 终态 → *model.TableNotFoundError，
-		// applier 整组 DLQ 并前进 offset）与「表存在但无列」（schema 异常 →
-		// fatal）；查询本身的失败在上面已按普通错误返回（fatal）。
+		// 三态区分（M2 复审 P2）：只有「库可见但表不可见」才判 NotFound
+		// （schema drift 终态 → *model.TableNotFoundError，applier 整组 DLQ
+		// 并前进 offset）。抓取账号对目标 schema 无可见权限时 TABLES 也得 0，
+		// 但 SCHEMATA 同样得 0 —— 此种情况误判 dropped 会整组 DLQ 静默丢
+		// 数据，必须走 fatal。「表可见但无列」= schema 异常，同样 fatal。
+		// 查询本身的失败在上面已按普通错误返回（fatal）。
+		var schemaVisible int
+		if err := sf.db.QueryRow(
+			`SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?`,
+			database).Scan(&schemaVisible); err != nil {
+			return nil, fmt.Errorf("check schema visibility %s: %w", database, err)
+		}
+		if schemaVisible == 0 {
+			return nil, fmt.Errorf("schema %s not visible to this account (dropped or insufficient privilege; refusing NotFound/DLQ)", database)
+		}
 		var n int
 		if err := sf.db.QueryRow(
 			`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
