@@ -374,10 +374,47 @@ func doUpdate(ctx context.Context, t *tiDBInfo, info *encoder.TableInfo, rng *ra
 		return nil, fmt.Errorf("dmlgen: update %s.%s: %w", t.schema, t.table, err)
 	}
 
-	// Data=改后整行（目标列替换新值）；Old=仅变更列旧值（TiCDC 形状）
-	after := cloneMap(row)
-	after[target.Name] = newVal
+	// after-image 以 UPDATE 后按 PK 回读为准（#t12 employees 现场：
+	// ON UPDATE CURRENT_TIMESTAMP 由服务端刷新，客户端 cloneMap 拼的
+	// after 带旧时间 → 增量 verify 在 last_update 列全量假 DIFF；真
+	// TiCDC 读实际行镜像，造数口径对齐）。Old=仅变更列旧值（TiCDC 形状）。
+	after, err := readRowByPK(ctx, t, info, pkVals)
+	if err != nil {
+		return nil, err
+	}
 	return buildRowMessage("UPDATE", info, after, target, oldVal), nil
+}
+
+// readRowByPK 按 PK 回读整行（UPDATE after-image 用）。
+func readRowByPK(ctx context.Context, t *tiDBInfo, info *encoder.TableInfo, pkVals []interface{}) (map[string]interface{}, error) {
+	cols := make([]string, len(info.Columns))
+	for i, c := range info.Columns {
+		cols[i] = quoteIdent(c.Name)
+	}
+	rows, err := t.db.QueryContext(ctx,
+		fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s",
+			joinCSV(cols), quoteIdent(t.schema), quoteIdent(t.table), wherePK(t)),
+		pkArgs(t, pkVals)...)
+	if err != nil {
+		return nil, fmt.Errorf("dmlgen: re-read %s.%s: %w", t.schema, t.table, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, fmt.Errorf("dmlgen: re-read %s.%s: row vanished after update", t.schema, t.table)
+	}
+	raw := make([]interface{}, len(info.Columns))
+	ptrs := make([]interface{}, len(info.Columns))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return nil, fmt.Errorf("dmlgen: scan re-read row: %w", err)
+	}
+	row := make(map[string]interface{}, len(info.Columns))
+	for i, c := range info.Columns {
+		row[c.Name] = raw[i]
+	}
+	return row, nil
 }
 
 // doDelete 抽一行 → DELETE → 编码消息（Data=被删整行）。表空返回 (nil, nil)。

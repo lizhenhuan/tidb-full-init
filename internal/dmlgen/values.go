@@ -41,7 +41,40 @@ func genValue(mysqlType string, rng *rand.Rand) interface{} {
 	case "float", "double", "real":
 		return float64(rng.Intn(1_000_000)) / 100
 	case "decimal", "numeric":
-		return fmt.Sprintf("%d.%02d", rng.Intn(100000), rng.Intn(100))
+		// 按列精度生成：decimal(M,D) 整数位 ≤ M-D 位、小数恰 D 位。
+		// 固定 5 位整数生成在窄列（payment.amount decimal(5,2) 上限
+		// 999.99）上整批 Out of range（#t12 现场，dmlgen 被直接拦停）。
+		m, dec := 10, 0
+		if i := strings.Index(mt, "("); i >= 0 {
+			rest := mt[i+1:]
+			if j := strings.Index(rest, ")"); j > 0 {
+				if parts := strings.Split(rest[:j], ","); len(parts) <= 2 {
+					if v, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+						m = v
+					}
+					if len(parts) == 2 {
+						if v, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+							dec = v
+						}
+					}
+				}
+			}
+		}
+		intDigits, fracDigitsN := m-dec, dec
+		if intDigits < 0 { // 异常定义防御
+			intDigits = 0
+		}
+		// intDigits==0 合法（decimal(1,1) 值域 0.0~0.9）：10^0=1 → 整数部恒 0
+		if intDigits > 15 { // int64 值域上限，宽度截断（值域覆盖无需穷尽）
+			intDigits = 15
+		}
+		if fracDigitsN > 9 {
+			fracDigitsN = 9
+		}
+		if fracDigitsN == 0 {
+			return fmt.Sprintf("%d", rng.Intn(intPow(10, intDigits)))
+		}
+		return fmt.Sprintf("%d.%0*d", rng.Intn(intPow(10, intDigits)), fracDigitsN, rng.Intn(intPow(10, fracDigitsN)))
 	case "date":
 		return fmt.Sprintf("20%02d-%02d-%02d", rng.Intn(25), rng.Intn(12)+1, rng.Intn(28)+1)
 	case "datetime", "timestamp":
@@ -150,14 +183,6 @@ func wherePK(t *tiDBInfo) string {
 }
 
 func pkArgs(t *tiDBInfo, pkVals []interface{}) []interface{} { return pkVals }
-
-func cloneMap(m map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
 
 // widthOf 从 "varchar(255)"/"decimal(10,2)" 取第一个宽度参数。
 // 注意仅对字符串/二进制类型有意义（数值类型的 (N) 是显示宽度）。
