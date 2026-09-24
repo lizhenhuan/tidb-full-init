@@ -19,6 +19,9 @@ func goldenMeta() *TableMetaFull {
 			{Name: "status", MySQLType: "varchar(16)", Nullable: true, HasDefault: true, Default: "new"},
 			{Name: "flag", MySQLType: "bit(8)", Nullable: true, HasDefault: true, Default: "b'101'"},
 			{Name: "created_at", MySQLType: "datetime", Nullable: true, HasDefault: true, Default: "CURRENT_TIMESTAMP"},
+		// NOT NULL + 默认值并存（#t8 再重开 P1：黄金此前无此形态，漏检
+		// ORA-03076——语法序 DEFAULT 必须在前）
+		{Name: "updated_at", MySQLType: "timestamp", Nullable: false, HasDefault: true, Default: "CURRENT_TIMESTAMP"},
 			{Name: "note", MySQLType: "text", Nullable: true},
 		},
 		PKNames: []string{"id"},
@@ -48,6 +51,7 @@ func TestConvertGolden(t *testing.T) {
 			"  \"status\" VARCHAR2(16 CHAR) DEFAULT 'new',\n" +
 			"  \"flag\" NUMBER DEFAULT 5,\n" +
 			"  \"created_at\" TIMESTAMP DEFAULT SYSTIMESTAMP,\n" +
+			"  \"updated_at\" TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,\n" +
 			"  \"note\" CLOB\n" +
 			"  ,CONSTRAINT \"PK_orders\" PRIMARY KEY (\"id\")\n" +
 			"  ,CONSTRAINT \"UK_uk_order\" UNIQUE (\"order_no\")\n" +
@@ -169,6 +173,43 @@ func TestColumnModsEdges(t *testing.T) {
 	// 坏位串必须报错（failed 可见）
 	if _, err := columnMods(ColumnMeta{HasDefault: true, Default: "b'2'"}, "NUMBER"); err == nil {
 		t.Error("bad bit default b'2' should error")
+	}
+}
+
+// TestColumnModsDefaultBeforeNotNull P1 钉子（#t8 再重开，leader #t12 用例
+// 池 11/11 撞 ORA-03076）：NOT NULL 与默认值并存时 DEFAULT 必须在 NOT NULL
+// 之前（Oracle 列定义语法序）。覆盖全部默认值分支 × NOT NULL 组合。
+func TestColumnModsDefaultBeforeNotNull(t *testing.T) {
+	cases := []struct {
+		name       string
+		col        ColumnMeta
+		oracleType string
+	}{
+		{"ct timestamp", ColumnMeta{Nullable: false, HasDefault: true, Default: "CURRENT_TIMESTAMP"}, "TIMESTAMP"},
+		{"decimal literal", ColumnMeta{Nullable: false, HasDefault: true, Default: "0.00"}, "NUMBER(10,2)"},
+		{"bit literal", ColumnMeta{Nullable: false, HasDefault: true, Default: "b'101'"}, "NUMBER"},
+		{"string literal", ColumnMeta{Nullable: false, HasDefault: true, Default: "o'k"}, "VARCHAR2(8 CHAR)"},
+		{"explicit NULL", ColumnMeta{Nullable: false, HasDefault: true, Default: "NULL"}, "CLOB"},
+		{"empty string default", ColumnMeta{Nullable: false, HasDefault: true, Default: ""}, "VARCHAR2(8 CHAR)"},
+		{"func passthrough", ColumnMeta{Nullable: false, HasDefault: true, Default: "uuid()"}, "VARCHAR2(64 CHAR)"},
+		{"ct dropped non-timestamp", ColumnMeta{Nullable: false, HasDefault: true, Default: "current_timestamp()"}, "NUMBER(3)"},
+	}
+	for _, c := range cases {
+		mods, err := columnMods(c.col, c.oracleType)
+		if err != nil {
+			t.Fatalf("%s: err %v", c.name, err)
+		}
+		if !strings.HasSuffix(mods, "NOT NULL") {
+			t.Errorf("%s: NOT NULL must be the trailing clause: %q", c.name, mods)
+		}
+		// 有默认值且未被丢弃的分支：DEFAULT 必须出现在 NOT NULL 之前
+		if c.col.Default != "current_timestamp()" { // 该分支时间默认被丢弃，无 DEFAULT 合法
+			di := strings.Index(mods, "DEFAULT")
+			ni := strings.LastIndex(mods, "NOT NULL")
+			if di < 0 || di > ni {
+				t.Errorf("%s: DEFAULT must precede NOT NULL (ORA-03076): %q", c.name, mods)
+			}
+		}
 	}
 }
 

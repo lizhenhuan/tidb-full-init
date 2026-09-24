@@ -208,7 +208,10 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 	return stmts, extra, nil
 }
 
-// columnMods 生成 NOT NULL / DEFAULT 子句。
+// columnMods 生成 DEFAULT / NOT NULL 子句。
+// 语法序铁律：Oracle 列定义 DEFAULT 必须在 NOT NULL 之前
+// （`NOT NULL DEFAULT ...` → ORA-03076；#t8 重开 P1，leader #t12
+// 用例池 11/11 ready 表全挂，均为 NOT NULL+默认值 timestamp 列）。
 // 默认值口径（t2o ChangeTableColumnDefaultValue 移植 + 收敛）：
 //   - 无显式默认：可空列省略（隐式 NULL），NOT NULL 列省略（无默认）；
 //   - 函数/关键字默认（CURRENT_TIMESTAMP 等）：不引号，TIMESTAMP 列
@@ -217,44 +220,47 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 //   - 字符串字面量：单引号 + '' doubling。
 func columnMods(c ColumnMeta, oracleType string) (string, error) {
 	mods := ""
-	if !c.Nullable {
-		mods = " NOT NULL"
-	}
-	if !c.HasDefault {
-		return mods, nil
-	}
-	def := strings.TrimSpace(c.Default)
-	switch {
-	case def == "", strings.EqualFold(def, "NULL"):
-		return mods + " DEFAULT NULL", nil
-	case isFunctionDefault(def):
-		if strings.EqualFold(def, "CURRENT_TIMESTAMP") ||
-			strings.EqualFold(def, "now()") ||
-			strings.EqualFold(def, "current_timestamp()") {
-			if strings.HasPrefix(oracleType, "TIMESTAMP") {
-				return mods + " DEFAULT SYSTIMESTAMP", nil
+	if c.HasDefault {
+		def := strings.TrimSpace(c.Default)
+		switch {
+		case def == "", strings.EqualFold(def, "NULL"):
+			mods = " DEFAULT NULL"
+		case isFunctionDefault(def):
+			if strings.EqualFold(def, "CURRENT_TIMESTAMP") ||
+				strings.EqualFold(def, "now()") ||
+				strings.EqualFold(def, "current_timestamp()") {
+				if strings.HasPrefix(oracleType, "TIMESTAMP") {
+					mods = " DEFAULT SYSTIMESTAMP"
+				}
+				// 非 TIMESTAMP 目标列：丢弃时间默认（mods 保持 ""；
+				// 记兼容项由上层补充属 P2）
+			} else if isStringTarget(oracleType) && !strings.Contains(def, "(") {
+				// 裸标识符默认（无括号）落在字符串目标列上：
+				// information_schema 对字符串默认可能去引号存储
+				// （MySQL 5.7 口径；TiDB 8 侧 L2 实测定案），按字面量
+				// 加引号更安全——误引号最多 ORA-00904 可见，漏引号会把
+				// 字面量当列引用。
+				mods = fmt.Sprintf(" DEFAULT '%s'", escapeSingleQuotes(def))
+			} else {
+				// 其他函数默认：原样透传（与 t2o 口径一致；坏函数由
+				// Oracle 执行期报错可见）
+				mods = fmt.Sprintf(" DEFAULT %s", def)
 			}
-			return mods + "", nil // 非 TIMESTAMP 目标列：丢弃时间默认（记兼容项由上层补充属 P2）
+		case strings.HasPrefix(def, "b'") && strings.HasSuffix(def, "'"):
+			bin := def[2 : len(def)-1]
+			n, err := strconv.ParseUint(bin, 2, 64)
+			if err != nil {
+				return "", fmt.Errorf("bad bit default %q: %w", def, err)
+			}
+			mods = fmt.Sprintf(" DEFAULT %d", n)
+		default:
+			mods = fmt.Sprintf(" DEFAULT '%s'", escapeSingleQuotes(def))
 		}
-		// 裸标识符默认（无括号）落在字符串目标列上：information_schema
-		// 对字符串默认可能去引号存储（MySQL 5.7 口径；TiDB 8 侧 L2 实测
-		// 定案），按字面量加引号更安全——误引号最多 ORA-00904 可见，
-		// 漏引号会把字面量当列引用。
-		if isStringTarget(oracleType) && !strings.Contains(def, "(") {
-			return fmt.Sprintf("%s DEFAULT '%s'", mods, escapeSingleQuotes(def)), nil
-		}
-		// 其他函数默认：原样透传（与 t2o 口径一致；坏函数由 Oracle 执行期报错可见）
-		return fmt.Sprintf("%s DEFAULT %s", mods, def), nil
-	case strings.HasPrefix(def, "b'") && strings.HasSuffix(def, "'"):
-		bin := def[2 : len(def)-1]
-		n, err := strconv.ParseUint(bin, 2, 64)
-		if err != nil {
-			return "", fmt.Errorf("bad bit default %q: %w", def, err)
-		}
-		return fmt.Sprintf("%s DEFAULT %d", mods, n), nil
-	default:
-		return fmt.Sprintf("%s DEFAULT '%s'", mods, escapeSingleQuotes(def)), nil
 	}
+	if !c.Nullable {
+		mods += " NOT NULL" // 恒末尾（ORA-03076 语法序）
+	}
+	return mods, nil
 }
 
 // isFunctionDefault 函数/关键字默认的粗判：标识符开头且全为字母数字/
