@@ -53,6 +53,12 @@ func (r *Reader) ScanTable(
 		log.Printf("[%s.%s] snapshot startTs=%d", cfg.Database, cfg.TableName, startTs)
 	}
 
+	// Parallelism<=0 时兜底默认 4：config.LoadConfig 会填，但直接构造
+	// Config 的调用方（如 tidb-batch）可能漏填——0 会让 splitKeyRange
+	// 退化单分区、errCh 无缓冲（#t6 复审 P0-1）。
+	if cfg.Parallelism <= 0 {
+		cfg.Parallelism = 4
+	}
 	ranges := splitKeyRange(startKey, endKey, cfg.Parallelism)
 	log.Printf("[%s.%s] split into %d ranges (parallelism=%d)", cfg.Database, cfg.TableName, len(ranges), cfg.Parallelism)
 
@@ -63,7 +69,11 @@ func (r *Reader) ScanTable(
 
 	var totalRows int64
 	var wg sync.WaitGroup
-	errCh := make(chan error, cfg.Parallelism)
+	// 容量必须与 parallelism 解耦：每个 worker 最多发一个致命错误后返回，
+	// 容量=len(ranges)=worker 数保证任何配置下发送方永不阻塞
+	// （曾为 cfg.Parallelism，0 → 无缓冲 → worker 卡 send、主协程卡
+	// wg.Wait 的永久死锁，#t6 复审 P0-1）。
+	errCh := make(chan error, len(ranges))
 
 	for i, kr := range ranges {
 		wg.Add(1)

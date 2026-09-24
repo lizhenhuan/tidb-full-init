@@ -439,7 +439,9 @@ func toTableConfigs(tables []tableEntry) []config.TableConfig {
 	for _, te := range tables {
 		tc, ok := byDB[te.db]
 		if !ok {
-			tc = &config.TableConfig{Database: te.db}
+			// Parallelism 显式给默认：直接构造的 Config 不走
+			// config.LoadConfig 的 fill（#t6 复审 P0-1 死锁诱因之一）
+			tc = &config.TableConfig{Database: te.db, Parallelism: 4}
 			byDB[te.db] = tc
 			order = append(order, te.db)
 		}

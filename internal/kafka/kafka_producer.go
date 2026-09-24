@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -26,6 +27,8 @@ type KafkaProducerConfig struct {
 	BatchSize     int
 	LingerMs      int
 	MaxAttempts   int
+	WriteTimeoutMs int // 单次写超时（默认 30000；broker 不 ack 时报错而非无限等）
+	BatchTimeoutMs int // 未满批强制冲刷间隔（默认 500）
 }
 
 func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
@@ -68,6 +71,15 @@ func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
 		maxAttempts = 3
 	}
 
+	writeTimeout := time.Duration(cfg.WriteTimeoutMs) * time.Millisecond
+	if writeTimeout <= 0 {
+		writeTimeout = 30 * time.Second
+	}
+	batchTimeout := time.Duration(cfg.BatchTimeoutMs) * time.Millisecond
+	if batchTimeout <= 0 {
+		batchTimeout = 500 * time.Millisecond
+	}
+
 	w := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Topic:        cfg.Topic,
@@ -76,6 +88,11 @@ func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
 		RequiredAcks: acks,
 		Compression:  compression,
 		MaxAttempts:  maxAttempts,
+		// 超时兜底（#t6 复审 P0-2）：调用方 ctx 无 deadline 时，
+		// broker 停止 ack 会让 WriteMessages 永久挂在 <-batch.done。
+		// WriteTimeout 是整次写（含重试）的绝对 deadline。
+		WriteTimeout: writeTimeout,
+		BatchTimeout: batchTimeout,
 		Async:        false,
 	}
 
@@ -85,6 +102,8 @@ func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
 	return &KafkaProducer{writer: w}, nil
 }
 
+// Send 发送一条消息。超时由 Writer.WriteTimeout 兜底（调用方 ctx 无
+// deadline 时 30s；broker 不 ack 报错而非永久阻塞）。
 func (p *KafkaProducer) Send(ctx context.Context, msg *Message) error {
 	err := p.writer.WriteMessages(ctx, kafka.Message{
 		Key:   msg.Key,
