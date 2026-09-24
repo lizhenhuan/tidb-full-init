@@ -61,9 +61,12 @@ func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
 		compression = kafka.Zstd
 	}
 
+	// 默认 1：Send 是逐条同步写，批凑不满时 kafka-go 只等 batch.timer
+	// （每条白等一个 BatchTimeout，#t6 复审实测）。需要攒批的调用方应
+	// 自己一次 WriteMessages 多条，而不是调大这里的 BatchSize。
 	batchSize := cfg.BatchSize
 	if batchSize <= 0 {
-		batchSize = 100
+		batchSize = 1
 	}
 
 	maxAttempts := cfg.MaxAttempts

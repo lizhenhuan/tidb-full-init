@@ -129,7 +129,11 @@ func runTable(ctx context.Context, reader *snapshot.Reader, schemaFetcher *tidb.
 			Topic:       topic,
 			Acks:        1,
 			Compression: "snappy",
-			BatchSize:   100,
+			// BatchSize=1：Send 是逐条同步写（Async:false），批永远凑不满；
+			// kafka-go v0.4.51 awaitBatch 只等 batch.timer（WriteTimeout 管不到），
+			// BatchSize>1 时每条消息都要白等一个 BatchTimeout（#t6 复审实测
+			// ≈0.55s/行）。吞吐真修复（攒批一次 WriteMessages）另行。
+			BatchSize:   1,
 			MaxAttempts: 3,
 		})
 		if err != nil {
