@@ -52,7 +52,7 @@ dialect 扩展：`RenderCreateTableFull`（列默认值/NULL/注释/UK/索引/�
   - `ddl` 在 **failed 时亦必填**（#t10 终评 low 项，P1 已落地）：convert 期列级不兼容的表用 `SkipBadColumns` 模式生成基线——不兼容列跳过、引用该列的 PK/UK/索引/注释剔除、语句头部 `--` 注释标记中断点，供前端 FixedDDL 编辑器起稿（绝不直接执行）
   - `skipped` 仅两态：表已存在且 overwrite=false（ORA-00955）/ 表级 charset 不兼容
 - `POST /jobs/{id}/ddl-rerun`：`{table, fixedDdl?}`——fixedDdl **base64**（TMS 线上语义）；只重跑 failed 表；幂等（重跑前该表按 overwrite 语义处理）
-- `POST /oracle/ddl-preview`：契约已有（前端 client/mock），**后端实现列入 P2 清单**（当前无 Go handler），响应含 `compat[]`（同上结构）
+- `POST /oracle/ddl-preview`：**P2 已实现**（`internal/api`，走 DryRun）。契约扩展：body 需带 `tidbDatasourceId`（原契约只有 oracleDatasourceId+tables 无法定位源端），`tables` 为 `db.table` 全限定名；响应含 `compat[]`（同上结构）
 - `/tidb/schemas`：复用
 
 ## 4. DB 变更
