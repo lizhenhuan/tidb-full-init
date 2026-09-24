@@ -3,8 +3,12 @@ package oraclesink
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"syscall"
 	"testing"
 	"time"
 
@@ -146,7 +150,15 @@ func TestClassify(t *testing.T) {
 		context.Canceled,
 		context.DeadlineExceeded,
 		fmt.Errorf("write batch: %w", context.Canceled), // 包装后仍可识别
-		sql.ErrTxDone, // ctx 取消与自动回滚的竞态残留（真库实测）
+		sql.ErrTxDone,     // ctx 取消与自动回滚的竞态残留（真库实测）
+		driver.ErrBadConn, // 一次网络抖动不应升级为任务中止（M2 复审 P1#2）
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		syscall.ECONNRESET,
+		syscall.EPIPE,
+		syscall.ECONNREFUSED,
+		&net.OpError{Op: "read", Net: "tcp", Err: errors.New("i/o timeout")}, // net.Error
+		fmt.Errorf("wrapped: %w", syscall.ECONNRESET),                       // 包装后仍可识别
 	}
 	for _, err := range retryable {
 		got := classify(err)

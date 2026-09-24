@@ -5,11 +5,15 @@ package oraclesink
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	goorav2 "github.com/sijms/go-ora/v2"
@@ -357,15 +361,17 @@ func dataError(err error) error {
 //   - fatal（默认：表不存在 00942、非法标识符 00904、权限不足 01031、
 //     未知错误等）→ 返回错误中止任务，不前进 offset，人工排查。
 //
-// 无 ORA 码（code=0）的驱动级错误：ctx 取消/超时按 retryable
-// （契约口径：ctx 取消不是致命错误；真库实测 ctx 超时会触发 database/sql
-// 的自动回滚，后续语句/Commit 抛 sql.ErrTxDone —— 同属"本批结果未知"
-// 竞态，整批重放）；其余按 fatal。
+// 无 ORA 码（code=0）的驱动级错误分类（M2 复审 P1#2）：
+//   - ctx 取消/超时、sql.ErrTxDone（ctx 取消与自动回滚的竞态残留，
+//     真库实测）→ retryable，语义同"本批结果未知"；
+//   - 瞬时网络层错误（不携带 ORA 码）：driver.ErrBadConn、net.Error
+//     （i/o timeout 等）、io.EOF/ErrUnexpectedEOF、ECONNRESET/EPIPE/
+//     ECONNREFUSED → retryable（MaxRetries 有界，不会死循环）；
+//   - 其余未知 → fatal。
 func classify(err error) error {
 	code := oraErrorCode(err)
 	if code == 0 {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-			errors.Is(err, sql.ErrTxDone) {
+		if isTransientDriverError(err) {
 			return &WriteError{Err: err, Code: code, Retryable: true}
 		}
 		return &WriteError{Err: err, Code: code}
@@ -378,6 +384,21 @@ func classify(err error) error {
 	default:
 		return &WriteError{Err: err, Code: code}
 	}
+}
+
+// isTransientDriverError 判断无 ORA 码错误的瞬时性（M2 复审 P1#2）：
+// 一次网络抖动不应升级为任务中止。errors.Is/As 走链式查找，
+// fmt.Errorf("%w") 包装与 database/sql 内层替换（driver.ErrBadConn）均可识别。
+func isTransientDriverError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, sql.ErrTxDone) || errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var netErr net.Error // 覆盖 i/o timeout、连接被重置等 net 层错误
+	return errors.As(err, &netErr)
 }
 
 // WriteError 携带 ORA 错误码的三态分类错误（见 classify）。

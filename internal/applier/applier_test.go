@@ -121,7 +121,10 @@ var testPartitions = []model.TopicPartition{{Topic: "t.orders", Partition: 0}}
 
 func testMeta(db, table string) (model.TableMeta, error) {
 	if db == "missing" {
-		return model.TableMeta{}, fmt.Errorf("no such table %s.%s", db, table)
+		return model.TableMeta{}, &TableNotFoundError{Database: db, Table: table}
+	}
+	if db == "flaky" { // 模拟 SchemaFetcher 瞬时不可用（非 NotFound）
+		return model.TableMeta{}, fmt.Errorf("dial tcp 10.168.2.232:4000: connect: connection refused")
 	}
 	return model.TableMeta{
 		Database: db, TargetSchema: "tgt", Table: table,
@@ -363,7 +366,7 @@ func TestPipelineResumeFromCheckpoint(t *testing.T) {
 	}
 }
 
-// 元数据缺失（schema drift 疑似）：整组进 DLQ，任务不中止、窗口前进。
+// 元数据「表已从源删除」（*TableNotFoundError）：整组进 DLQ，任务不中止、窗口前进。
 func TestPipelineMetaMissingGroupDLQ(t *testing.T) {
 	cons := &fakeConsumer{msgs: []consumer.Message{insertMsg(0, "missing", "t1", "1")}}
 	store := checkpoint.NewMemoryStore()
@@ -371,11 +374,11 @@ func TestPipelineMetaMissingGroupDLQ(t *testing.T) {
 
 	runErr, m := runPipeline(t, cons, mocksink.New(), store, dlq)
 	if runErr != nil {
-		t.Fatalf("Run: %v (meta missing must not abort)", runErr)
+		t.Fatalf("Run: %v (table-dropped must not abort)", runErr)
 	}
 	rows := dlq.snapshot()
-	if len(rows) != 1 || !strings.Contains(rows[0].Reason, "meta unavailable") {
-		t.Fatalf("DLQ rows = %+v, want meta-unavailable row", rows)
+	if len(rows) != 1 || !strings.Contains(rows[0].Reason, "table dropped from source") {
+		t.Fatalf("DLQ rows = %+v, want table-dropped row", rows)
 	}
 	off, _ := store.Load(context.Background(), testPartitions[0])
 	if off != 0 {
@@ -383,5 +386,69 @@ func TestPipelineMetaMissingGroupDLQ(t *testing.T) {
 	}
 	if m.AppliedEvents != 0 || m.DLQEvents != 1 {
 		t.Errorf("applied=%d dlq=%d, want 0/1", m.AppliedEvents, m.DLQEvents)
+	}
+}
+
+// 元数据瞬时不可用（非 NotFound，M2 复审 P1#1）：fatal —— 中止任务、
+// 不前进 offset，绝不把整表事件 DLQ 越过位点（静默丢数据）。
+func TestPipelineMetaTransientFatal(t *testing.T) {
+	cons := &fakeConsumer{msgs: []consumer.Message{insertMsg(0, "flaky", "t1", "1")}}
+	store := checkpoint.NewMemoryStore()
+	dlq := &dlqRecorder{}
+
+	runErr, m := runPipeline(t, cons, mocksink.New(), store, dlq)
+	if runErr == nil {
+		t.Fatal("Run must fail on transient meta error")
+	}
+	if !strings.Contains(runErr.Error(), "not advancing offset") {
+		t.Errorf("Run error = %v, want transient-meta fatal marker", runErr)
+	}
+	off, _ := store.Load(context.Background(), testPartitions[0])
+	if off != -1 {
+		t.Errorf("checkpoint = %d, want -1 (no advance)", off)
+	}
+	if len(dlq.snapshot()) != 0 || m.DLQEvents != 0 {
+		t.Errorf("transient meta error must not write DLQ: rows=%d events=%d", len(dlq.snapshot()), m.DLQEvents)
+	}
+}
+
+// 纯 DDL 窗口（M2 复审 P2#4）：无行要写，但位点仍要前进（lag 不假高）。
+func TestPipelinePureDDLAdvancesOffset(t *testing.T) {
+	cons := &fakeConsumer{msgs: []consumer.Message{
+		{TopicPartition: testPartitions[0], Offset: 5,
+			Value: []byte(`{"database":"d","table":"t1","isDdl":true,"type":"QUERY","sql":"ALTER TABLE t1 ADD c INT"}`)},
+	}}
+	store := checkpoint.NewMemoryStore()
+
+	runErr, m := runPipeline(t, cons, mocksink.New(), store, nil)
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+	off, _ := store.Load(context.Background(), testPartitions[0])
+	if off != 5 {
+		t.Errorf("checkpoint = %d, want 5 (pure-DDL window must advance)", off)
+	}
+	if m.SkippedDDL != 1 || m.AppliedEvents != 0 {
+		t.Errorf("skipped=%d applied=%d, want 1/0", m.SkippedDDL, m.AppliedEvents)
+	}
+}
+
+// 消费者不支持 SetStartOffsets 且存在恢复位点（M2 复审 P2#5）：fail-fast。
+type hideStartConsumer struct{ consumer.Consumer }
+
+func TestPipelineResumeFailFast(t *testing.T) {
+	inner := &fakeConsumer{msgs: []consumer.Message{insertMsg(6, "d", "t1", "9")}}
+	cons := &hideStartConsumer{Consumer: inner} // 隐藏 SetStartOffsets
+	store := checkpoint.NewMemoryStore()
+	if err := store.Save(context.Background(), testPartitions[0], 5); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr, _ := runPipeline(t, cons, mocksink.New(), store, nil)
+	if runErr == nil {
+		t.Fatal("Run must fail fast when resume offsets cannot be delivered")
+	}
+	if !strings.Contains(runErr.Error(), "SetStartOffsets") {
+		t.Errorf("Run error = %v, want SetStartOffsets fail-fast marker", runErr)
 	}
 }
