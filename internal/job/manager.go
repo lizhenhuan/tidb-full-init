@@ -193,6 +193,9 @@ func (m *Manager) runDdlSync(ctx context.Context, jobID int64, p *DdlSyncPayload
 		}
 		for _, t := range res.Tables {
 			row := toRow(t)
+			// table_name 存 db.table 全限定（冒烟 #1 正确性：跨库同名表
+			// 在一个 job 内必须唯一；rerun 入参同形）。
+			row.Table = g.Database + "." + t.Table
 			// 无 PK 表：结构可建，数据任务将被管道拒绝（口径 A warnings）
 			if t.Status == ddlsync.StatusSuccess && hasNoPK(tidbDB, g.Database, t.Table) {
 				row.Warnings = []string{"无主键：结构已创建，后续全量/增量任务将被管道 ValidateTable 拒绝（已知差异）"}
@@ -249,7 +252,7 @@ func (m *Manager) DdlRerun(ctx context.Context, jobID int64, table, fixedDdlB64 
 		return nil, nil, err
 	}
 	if row == nil {
-		return nil, []string{fmt.Sprintf("表 %s 不在本任务结果中", table)}, nil
+		return nil, []string{fmt.Sprintf("表 %s 不在本任务结果中（table 需为 db.table 全限定，与 ddlResults.table 同形）", table)}, nil
 	}
 	if row.Status != "failed" {
 		return nil, []string{"只能重跑 failed 表（当前 " + row.Status + "）"}, nil
@@ -297,7 +300,30 @@ func (m *Manager) DdlRerun(ctx context.Context, jobID int64, table, fixedDdlB64 
 	if err := m.Store.UpsertDDLResult(jobID, row); err != nil {
 		return nil, nil, err
 	}
+	// 冒烟 #2：重跑后重算任务终态（全部行非 failed → success）
+	if err := m.recomputeTerminal(jobID); err != nil {
+		return nil, nil, err
+	}
 	return row, nil, nil
+}
+
+// recomputeTerminal 按 ddl_results 现值重算任务终态与 summary。
+func (m *Manager) recomputeTerminal(jobID int64) error {
+	rows, err := m.Store.ListDDLResults(jobID)
+	if err != nil {
+		return err
+	}
+	failed := 0
+	for _, r := range rows {
+		if r.Status == "failed" {
+			failed++
+		}
+	}
+	status, summary := "success", fmt.Sprintf("%d 表完成", len(rows))
+	if failed > 0 {
+		status, summary = "failed", fmt.Sprintf("%d/%d 表失败", failed, len(rows))
+	}
+	return m.Store.UpdateJobStatus(jobID, status, 100, "", summary, "")
 }
 
 func oraCodeOf(err error) string {
