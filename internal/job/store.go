@@ -140,9 +140,40 @@ CREATE TABLE IF NOT EXISTS ddl_results (
   error_code TEXT NOT NULL DEFAULT '',
   error_text TEXT NOT NULL DEFAULT '',
   compat_json TEXT NOT NULL DEFAULT '[]',
+  warnings_json TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (job_id, table_name)
 );`)
+	if err != nil {
+		return err
+	}
+	return s.migrateDDLResultsWarnings()
+}
+
+// migrateDDLResultsWarnings 幂等迁移：旧库 ddl_results 无 warnings_json 列
+// （#t8 重开缺陷：warnings 曾在 store 三处静默丢弃——建表/写/读全断）。
+// CREATE TABLE IF NOT EXISTS 不作用于已存在的表，需按 PRAGMA 探列后补列。
+func (s *Store) migrateDDLResultsWarnings() error {
+	rows, err := s.db.Query(`PRAGMA table_info(ddl_results)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "warnings_json" {
+			return nil // 已有列（新库/已迁移）
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ddl_results ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'`)
 	return err
 }
 
@@ -306,27 +337,32 @@ func (s *Store) ListJobs() ([]*Job, error) {
 
 // ---- ddl_results ----
 
-// UpsertDDLResult 单表结果（重跑 upsert 同入口，幂等）。
+// UpsertDDLResult 单表结果（重跑 upsert 同入口，幂等）。warnings 与
+// compat 同口径落 JSON（#t8 重开：此前 warnings 不落库，REST 路径必丢）。
 func (s *Store) UpsertDDLResult(jobID int64, r *DDLResultRow) error {
 	compat, err := json.Marshal(r.Compat)
 	if err != nil {
 		return err
 	}
+	warn, err := json.Marshal(r.Warnings)
+	if err != nil {
+		return err
+	}
 	_, err = s.db.Exec(`INSERT INTO ddl_results
-		(job_id,table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		(job_id,table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json,warnings_json,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(job_id, table_name) DO UPDATE SET
 		  target_table=excluded.target_table, status=excluded.status, ddl=excluded.ddl,
 		  fixed_ddl=excluded.fixed_ddl, error_code=excluded.error_code,
 		  error_text=excluded.error_text, compat_json=excluded.compat_json,
-		  updated_at=excluded.updated_at`,
-		jobID, r.Table, r.TargetTable, r.Status, r.DDL, r.FixedDDL, r.ErrorCode, r.ErrorText, string(compat), nowISO())
+		  warnings_json=excluded.warnings_json, updated_at=excluded.updated_at`,
+		jobID, r.Table, r.TargetTable, r.Status, r.DDL, r.FixedDDL, r.ErrorCode, r.ErrorText, string(compat), string(warn), nowISO())
 	return err
 }
 
 // ListDDLResults 按表名序（报告口径稳定）。
 func (s *Store) ListDDLResults(jobID int64) ([]DDLResultRow, error) {
-	rows, err := s.db.Query(`SELECT table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json
+	rows, err := s.db.Query(`SELECT table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json,warnings_json
 		FROM ddl_results WHERE job_id=? ORDER BY table_name`, jobID)
 	if err != nil {
 		return nil, err
@@ -335,11 +371,12 @@ func (s *Store) ListDDLResults(jobID int64) ([]DDLResultRow, error) {
 	var out []DDLResultRow
 	for rows.Next() {
 		var r DDLResultRow
-		var compat string
-		if err := rows.Scan(&r.Table, &r.TargetTable, &r.Status, &r.DDL, &r.FixedDDL, &r.ErrorCode, &r.ErrorText, &compat); err != nil {
+		var compat, warn string
+		if err := rows.Scan(&r.Table, &r.TargetTable, &r.Status, &r.DDL, &r.FixedDDL, &r.ErrorCode, &r.ErrorText, &compat, &warn); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(compat), &r.Compat)
+		_ = json.Unmarshal([]byte(warn), &r.Warnings)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -348,10 +385,10 @@ func (s *Store) ListDDLResults(jobID int64) ([]DDLResultRow, error) {
 // GetDDLResult 单表行（重跑入口；不存在 nil,nil）。
 func (s *Store) GetDDLResult(jobID int64, table string) (*DDLResultRow, error) {
 	var r DDLResultRow
-	var compat string
-	err := s.db.QueryRow(`SELECT table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json
+	var compat, warn string
+	err := s.db.QueryRow(`SELECT table_name,target_table,status,ddl,fixed_ddl,error_code,error_text,compat_json,warnings_json
 		FROM ddl_results WHERE job_id=? AND table_name=?`, jobID, table).
-		Scan(&r.Table, &r.TargetTable, &r.Status, &r.DDL, &r.FixedDDL, &r.ErrorCode, &r.ErrorText, &compat)
+		Scan(&r.Table, &r.TargetTable, &r.Status, &r.DDL, &r.FixedDDL, &r.ErrorCode, &r.ErrorText, &compat, &warn)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -359,5 +396,6 @@ func (s *Store) GetDDLResult(jobID int64, table string) (*DDLResultRow, error) {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(compat), &r.Compat)
+	_ = json.Unmarshal([]byte(warn), &r.Warnings)
 	return &r, nil
 }
