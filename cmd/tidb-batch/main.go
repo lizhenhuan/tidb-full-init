@@ -20,8 +20,14 @@
 //	  "sample": 0,
 //	  "consume-timeout-sec": 300,
 //	  "dml": {"inserts":50,"updates":20,"deletes":10,"seed":7},
-//	  "tables": ["db1.t1","db1.t2"]
+//	  "tables": ["db1.t1","db1.t2"],
+//	  "expect-dlq": {"db1.t2": {"ORA-01438": 2}}
 //	}
+//
+// expect-dlq（K3 口径）：对声明了期望死信的表，轮末按本轮 topic 机器断言
+// 「有损必须可见」——每个 ORA 码的行数与总行数都精确匹配（多余/缺失都
+// FAIL）。用于已知有损映射（如 decimal(65,30)→NUMBER(38,30) 溢出）的
+// 验收：损失行数落 DLQ 且 reason 可查，是 PASS 的前置可见性证据。
 //
 // Oracle 口令可用环境变量 ORACLE_FREE_PASSWORD 兜底（leader 口径）。
 package main
@@ -79,6 +85,10 @@ type batchCfg struct {
 	ConsumeTimeoutSec    int       `json:"consume-timeout-sec"`
 	DML                  dmlCfg    `json:"dml"`
 	Tables               []string  `json:"tables"`
+
+	// ExpectDLQ 表 → {ORA 码: 期望死信行数}。轮末按本轮 topic 断言
+	// 每个 ORA 码的行数与总行数精确匹配（K3「有损必须可见」机器校验）。
+	ExpectDLQ map[string]map[string]int `json:"expect-dlq"`
 }
 
 type tableEntry struct {
@@ -91,6 +101,8 @@ type tableResult struct {
 	rows                 int64
 	err                  error
 	stage                string
+	dlqAsserted          bool // expect-dlq 断言已执行（结果记入 err/dlqNote）
+	dlqNote              string
 }
 
 func main() {
@@ -135,6 +147,11 @@ func main() {
 		}
 		tables = append(tables, tableEntry{db: parts[0], table: parts[1]})
 	}
+	for key := range bc.ExpectDLQ {
+		if !containsTable(tables, key) {
+			log.Fatalf("tidb-batch: expect-dlq 引用的表 %q 不在 tables 列表", key)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -176,8 +193,12 @@ func main() {
 		} else {
 			incr = "DIFF"
 		}
-		fmt.Printf("  %-6s %-30s full=%-6s incr=%-6s rows=%d stage=%s err=%v\n",
-			status, k, boolStr(r.fullEqual), incr, r.rows, r.stage, r.err)
+		dlq := "-"
+		if r.dlqAsserted {
+			dlq = r.dlqNote
+		}
+		fmt.Printf("  %-6s %-30s full=%-6s incr=%-6s rows=%d dlq=%s stage=%s err=%v\n",
+			status, k, boolStr(r.fullEqual), incr, r.rows, dlq, r.stage, r.err)
 	}
 	if fail != nil {
 		fmt.Printf("round error: %v\n", fail)
@@ -190,6 +211,77 @@ func boolStr(b bool) string {
 		return "equal"
 	}
 	return "DIFF"
+}
+
+func containsTable(tables []tableEntry, key string) bool {
+	for _, te := range tables {
+		if te.db+"."+te.table == key {
+			return true
+		}
+	}
+	return false
+}
+
+// assertDLQ 机器校验「有损必须可见」（K3）：对 expect-dlq 声明的表，
+// 按本轮 topic（前缀唯一，天然限定本轮死信）断言两件事：
+//  1. 每个 ORA 码的行数（reason LIKE 匹配）与期望精确相等；
+//  2. 该表死信总行数等于期望之和（多出的未知 reason 也算 FAIL——
+//     「预期内的损失可见」与「没有预期外的损失」都要成立）。
+//
+// 断言失败记入该表 err（汇总 FAIL、退出码 1），不断轮。
+func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, tables []tableEntry, results map[string]*tableResult) {
+	byKey := make(map[string]tableEntry, len(tables))
+	for _, te := range tables {
+		byKey[te.db+"."+te.table] = te
+	}
+	for key, wantByCode := range bc.ExpectDLQ {
+		r := results[key]
+		te := byKey[key]
+		topic := prefix + te.db + "-" + te.table
+		r.dlqAsserted = true
+
+		var wantTotal int
+		parts := make([]string, 0, len(wantByCode))
+		for code, n := range wantByCode {
+			wantTotal += n
+			var got int
+			if err := ora.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t AND "reason" LIKE :pat`,
+				sql.Named("t", topic), sql.Named("pat", "%"+code+"%")).Scan(&got); err != nil {
+				r.err = wrapDLQErr(r.err, key, "query %s: %v", code, err)
+				continue
+			}
+			if got != n {
+				r.err = wrapDLQErr(r.err, key, "%s want %d rows, got %d", code, n, got)
+			}
+			parts = append(parts, fmt.Sprintf("%s:%d", code, got))
+		}
+		var gotTotal int
+		if err := ora.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t`,
+			sql.Named("t", topic)).Scan(&gotTotal); err != nil {
+			r.err = wrapDLQErr(r.err, key, "query total: %v", err)
+			continue
+		}
+		if gotTotal != wantTotal {
+			r.err = wrapDLQErr(r.err, key, "total want %d rows (sum of codes), got %d — unexpected DLQ reasons exist", wantTotal, gotTotal)
+		}
+		if r.err == nil {
+			sort.Strings(parts)
+			r.dlqNote = fmt.Sprintf("OK(%s)", strings.Join(parts, ","))
+		} else {
+			r.dlqNote = "FAIL"
+		}
+	}
+}
+
+// wrapDLQErr 追加 expect-dlq 断言错误，保留该表既有失败信息。
+func wrapDLQErr(prev error, key, format string, args ...interface{}) error {
+	e := fmt.Errorf("expect-dlq %s: %s", key, fmt.Sprintf(format, args...))
+	if prev == nil {
+		return e
+	}
+	return fmt.Errorf("%w; %s", prev, e)
 }
 
 // runRound 一轮批量：全量 → 消费 → verify →（可选增量）→ verify。
@@ -336,6 +428,11 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 		}
 	case <-time.After(60 * time.Second):
 		log.Printf("[batch] WARN syncer did not stop within 60s")
+	}
+
+	// ---- Step 5.5: DLQ 断言（expect-dlq，K3「有损必须可见」）----
+	if len(bc.ExpectDLQ) > 0 {
+		assertDLQ(ctx, ora, bc, prefix, tables, results)
 	}
 
 	// ---- Step 6: 清理（topic 删掉；位点文件保留供排查）----
