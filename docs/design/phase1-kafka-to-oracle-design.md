@@ -158,14 +158,24 @@ type RowFailure struct {
     Table     string
     Reason    string
     Raw       []byte // 原始消息体（applier 填充），供 DLQ 落库与前端死信列表展示
-    // Retryable=true 暂时性错误（网络/锁）整批退避重试；
-    // false 数据错误，写 DLQ 并前进 offset
+    // Retryable 保留字段：RowFailure 一律为行级数据错误（Retryable=false，
+    // 写 DLQ 并前进 offset）；可重试错误走整批 error 路径，不产生 RowFailure
     Retryable bool
 }
-// WriteBatch 失败契约：
-//   - 可重试错误 → 整体回滚，返回 *WriteError{Retryable:true}，applier 重放整批；
-//   - 数据错误 → 记 RowFailure 跳过该行，其余行照常提交；
-//   - Applied 只统计真正提交的行。
+// WriteBatch 失败契约（M1.5 P0#1 定稿 + 跟进复审 P1#1 三态化，真库实测确认）：
+//   - retryable（网络/锁/ctx 取消，sink.IsRetryable(err)=true）→ 整体回滚并
+//     返回错误；语义是"本批结果未知"（ctx 取消下事务可能未完全回滚，真库
+//     实测有部分行已提交的样例），applier 必须整批重放，绝不部分续传，
+//     error+Applied=0 不代表什么都没写；正确性由幂等 MERGE/DELETE +
+//     flush-后-commit 位点保证；ctx 取消不是致命错误；
+//   - row-data（行级数据错误，sink.IsRowData(err)=true，白名单 ORA 码
+//     00001/01722/01400/01840/01858/01861/12899）→ 记 RowFailure
+//     （Retryable=false）跳过该行，其余行照常提交，applier 写 DLQ 后前进 offset；
+//   - fatal（其余一切，含 ORA-00942/00904/01031 等配置/权限错误与无 ORA 码
+//     的未知驱动错误）→ 返回错误，applier 中止任务、不前进 offset，人工排查
+//     （避免把配置错误伪装成"成功+死信"静默丢数据）；
+//   - Applied 只统计真正提交的行；返回错误时 Applied/Failed 归零（已回滚，
+//     重放时重新推导）。
 
 // internal/dialect
 type TargetDialect interface {

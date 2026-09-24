@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 //
 //	ORACLE_FREE_HOST=127.0.0.1 ORACLE_FREE_PORT=1521 \
 //	ORACLE_FREE_SERVICE=FREEPDB1 ORACLE_FREE_USER=system \
-//	ORACLE_FREE_PASSWORD=Oracle123 go test ./internal/sink/oraclesink/ -run Integration -v
+//	ORACLE_FREE_PASSWORD=<password> go test ./internal/sink/oraclesink/ -run Integration -v
 func integrationEnv(t *testing.T) Config {
 	host := os.Getenv("ORACLE_FREE_HOST")
 	if host == "" {
@@ -151,6 +152,26 @@ func TestIntegrationWriteBatchShopSchema(t *testing.T) {
 		t.Fatalf("delete nonexistent: res=%+v err=%v", res, err)
 	}
 
+	// 5b) delete 侧数据错误（复审 P2#6）：NUMBER 主键绑非数字 → deleteStmt
+	// exec 抛 ORA-01722 → RowFailure 跳行 + deleteStmt 重建，同批后续好行提交。
+	// 与 upsert 侧（用例 3）对称，验证 reprepare 对两条语句都生效。
+	res, err = s.WriteBatch(ctx, meta, []model.RowEvent{
+		ev(model.OpDelete, "not-a-number", "", ""),
+		ev(model.OpInsert, "9004", "42.00", "after-bad-delete"),
+	})
+	if err != nil {
+		t.Fatalf("mixed delete batch err: %v", err)
+	}
+	if res.Applied != 1 || len(res.Failed) != 1 {
+		t.Fatalf("mixed delete batch: res=%+v", res)
+	}
+	if res.Failed[0].Retryable || !strings.Contains(res.Failed[0].Reason, "ORA-01722") {
+		t.Fatalf("delete-side failure should be ORA-01722 row-data: %+v", res.Failed[0])
+	}
+	if got := q(`SELECT COUNT(*) FROM "shop"."orders" WHERE "id"=9004`); got != "1" {
+		t.Fatalf("row after bad delete not committed: %s", got)
+	}
+
 	// 6) 可重试错误路径（复审 P1#1b/P1#3）：另一会话持有目标行锁，
 	// 短超时 ctx 触发失败 → 返回 WriteError{Retryable:true} 且 res 清空。
 	//
@@ -235,12 +256,18 @@ func TestIntegrationQuotedSchemaLogin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 小写用户名不加引号 → ORA-01017（证明不能拿 TargetSchema 直接当登录用户拼连接串）
+	// 小写用户名不加引号 → ORA-01017（证明不能拿 TargetSchema 直接当登录用户拼连接串）。
+	// shop 用户密码从环境变量取（复审 P2#3：口令不入库），未设置则跳过该子用例。
+	shopPwd := os.Getenv("ORACLE_FREE_SHOP_PASSWORD")
+	if shopPwd == "" {
+		t.Log("ORACLE_FREE_SHOP_PASSWORD not set; skipping unquoted-login subcase")
+		return
+	}
 	bad := cfg
-	bad.User, bad.Password = "shop", "shop123"
+	bad.User, bad.Password = "shop", shopPwd
 	url := goorav2.BuildUrl(bad.Host, bad.Port, bad.Service, bad.User, bad.Password, nil)
 	if _, err := sQueryOne(ctx, url); err == nil {
-		t.Log("shop/shop123 unquoted login unexpectedly succeeded (Oracle 版本差异)")
+		t.Log("unquoted lowercase login unexpectedly succeeded (Oracle 版本差异)")
 	} else {
 		t.Logf("unquoted lowercase login rejected as expected: %v", err)
 	}

@@ -82,12 +82,14 @@ func (s *Sink) Prepare(ctx context.Context, meta model.TableMeta) error {
 // WriteBatch 单批 = 单 Oracle 事务（D11）。PK 变更的 UPDATE 拆为
 // DELETE(旧 PK) + MERGE(新行)（D2）。
 //
-// 失败契约（M1.5 P0#1 定稿，与 sink.Sink 接口注释一致）：
-//   - 可重试错误（网络/锁，见 classify）→ 整体回滚，返回 *WriteError{Retryable:true}，
-//     由 applier 退避后重放整批；
-//   - 数据错误（绑定失败/ORA-00001/01722/12899 等）→ 记 RowFailure（Retryable=false，
-//     带 Kafka 坐标与表名，Raw 由 applier 填充）跳过该行，其余行照常提交；
-//   - Applied 只统计随本事务真正提交的行。
+// 失败契约（M1.5 P0#1 定稿 + 跟进复审 P1#1 三态化）：
+//   - retryable（网络/锁/ctx 取消）→ 整体回滚，返回 *WriteError{Retryable:true}；
+//     语义是"本批结果未知"（ctx 取消下事务可能已提交部分行），applier
+//     必须整批重放，绝不部分续传；
+//   - row-data（白名单 ORA 码，见 classify）→ 记 RowFailure（带 Kafka
+//     坐标与表名，Raw 由 applier 填充）跳过该行，其余行照常提交；
+//   - fatal（默认：表不存在/权限/未知错误）→ 返回错误中止任务，不前进 offset；
+//   - Applied 只统计随本事务真正提交的行；返回错误时 Applied/Failed 归零。
 func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []model.RowEvent) (sink.FlushResult, error) {
 	res := sink.FlushResult{}
 	upsertSQL, err := s.d.RenderUpsert(meta)
@@ -109,12 +111,14 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 	if err != nil {
 		return res, fmt.Errorf("oraclesink prepare upsert: %w", err)
 	}
-	defer upsertStmt.Close()
+	// 闭包捕获变量本身：reprepare 重赋值后 defer 关闭的是最终句柄
+	//（旧句柄在 reprepare 内已关闭，重复 Close 无害）——复审 P2#4。
+	defer func() { upsertStmt.Close() }()
 	deleteStmt, err := tx.PrepareContext(ctx, deleteSQL)
 	if err != nil {
 		return res, fmt.Errorf("oraclesink prepare delete: %w", err)
 	}
-	defer deleteStmt.Close()
+	defer func() { deleteStmt.Close() }()
 
 	applyOne := func(ev *model.RowEvent) error {
 		// PK 变更：先删旧行（D2）
@@ -166,9 +170,10 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 	for i := range events {
 		if err := applyOne(&events[i]); err != nil {
 			var we *WriteError
-			if errors.As(err, &we) && !we.Retryable {
-				// 数据错误 → 记 RowFailure 跳过该行，其余行照常提交（DLQ）。
-				// 执行失败的语句状态不可信，重建后继续。
+			if errors.As(err, &we) && we.RowData {
+				// 行级数据错误 → 记 RowFailure 跳过该行，其余行照常提交（DLQ）。
+				// 执行失败的语句状态不可信（ORA-01722 后复用会抛 ORA-03120），
+				// 重建后继续。
 				res.Failed = append(res.Failed, sink.RowFailure{
 					Topic: events[i].Topic, Partition: events[i].Partition,
 					Offset: events[i].Offset, Table: meta.Table,
@@ -184,7 +189,8 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 				}
 				continue
 			}
-			// 可重试 → 整批回滚（defer Rollback），交给 applier 重放整批：
+			// retryable 或 fatal → 整批回滚（defer Rollback）返回错误：
+			// retryable 由 applier 整批重放（幂等安全）；fatal 中止任务。
 			// 已累计的 Applied/Failed 全部随事务作废，重放时重新推导，
 			// 不能返回"已回滚但 Applied>0"的矛盾状态（复审 P1#3）。
 			res.Applied = 0
@@ -304,42 +310,95 @@ func convertValue(mysqlType, raw string) (any, error) {
 	}
 }
 
-// retryableORACodes 暂时性错误的 ORA 码（D11）：网络/锁。
-var retryableORACodes = map[int]bool{
-	12170: true, // 网络超时
-	3113:  true, // 连接断开
-	3114:  true,
-	54:    true, // 资源忙（锁）
-	31:    true, // 死锁标记
+// retryableORACode 暂时性错误的 ORA 码（D11 + M1.5 跟进复审 P1#2）：
+// 网络/锁。死锁是 ORA-00060（00031 是 session marked for kill，不在此列）。
+func retryableORACode(code int) bool {
+	switch code {
+	case 54, // 资源忙（锁等待）
+		60,   // 死锁（Oracle 自动回滚其中一方，重放即可）
+		1013, // 用户取消 / 锁等待超时
+		4021, // 锁等待超时
+		3113, // 连接断开
+		3114, // 未连接
+		3135, // 连接意外断开
+		3136, // 连接被重置
+		12170: // 网络超时
+		return true
+	}
+	// 12500-12599：TNS 协议/网络层故障
+	return code >= 12500 && code <= 12599
 }
 
-// dataError 把本地绑定/转换失败包装为不可重试的 WriteError（数据错误 → DLQ）。
+// rowDataORACodes 行级数据错误的 ORA 码白名单（跟进复审 P1#1）：
+// 只有这些才允许"跳行 + DLQ + 前进 offset"；其余非可重试错误一律
+// fatal（中止任务、不前进 offset），避免把表不存在/权限不足等配置
+// 错误伪装成"成功 + 死信"静默丢数据。
+var rowDataORACodes = map[int]bool{
+	1:     true, // 唯一冲突（MERGE 语义下不应出现，保守保留）
+	1722:  true, // 数字转换失败（坏值）
+	1400:  true, // NOT NULL 列插 NULL
+	1858:  true, // 非数字出现在日期数字处
+	1861:  true, // 日期字面量与格式串不匹配
+	1840:  true, // 输入值不够长
+	12899: true, // 值超出列宽
+}
+
+// dataError 把本地绑定/转换失败包装为行级数据错误（→ DLQ）。
 func dataError(err error) error {
-	return &WriteError{Err: err, Code: 0, Retryable: false}
+	return &WriteError{Err: err, Code: 0, RowData: true}
 }
 
-// classify 依据 ORA- 错误号分类（D11），返回 *WriteError：
-// 仅用于驱动/服务端返回的错误；本地绑定错误用 dataError。
-//   - 可重试：网络/锁（ORA-12170/00054/00031 等）→ applier 整批退避重放；
-//   - 无 ORA 码（code=0）的驱动级错误按暂时性处理（网络层居多），
-//     由 applier 的重试预算兜底防止死循环；
-//   - 数据错误：ORA-00001 唯一冲突/01722 数字转换/12899 值过宽 等
-//     → Retryable=false，WriteBatch 记 RowFailure 跳行（DLQ）。
+// classify 依据 ORA- 错误号做三态分类（D11 + M1.5 跟进复审 P1#1），
+// 仅用于驱动/服务端返回的错误；本地绑定错误用 dataError：
+//   - retryable（网络/锁，含 ctx 取消/超时）→ applier 整批退避重放，
+//     语义是"本批结果未知"，绝不部分续传；
+//   - row-data（白名单：值转换/宽度/约束类）→ WriteBatch 记 RowFailure
+//     跳过该行、其余行照常提交，applier 写 DLQ 后前进 offset；
+//   - fatal（默认：表不存在 00942、非法标识符 00904、权限不足 01031、
+//     未知错误等）→ 返回错误中止任务，不前进 offset，人工排查。
+//
+// 无 ORA 码（code=0）的驱动级错误：ctx 取消/超时按 retryable
+// （契约口径：ctx 取消不是致命错误；真库实测 ctx 超时会触发 database/sql
+// 的自动回滚，后续语句/Commit 抛 sql.ErrTxDone —— 同属"本批结果未知"
+// 竞态，整批重放）；其余按 fatal。
 func classify(err error) error {
 	code := oraErrorCode(err)
-	retryable := code == 0 || retryableORACodes[code]
-	return &WriteError{Err: err, Code: code, Retryable: retryable}
+	if code == 0 {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, sql.ErrTxDone) {
+			return &WriteError{Err: err, Code: code, Retryable: true}
+		}
+		return &WriteError{Err: err, Code: code}
+	}
+	switch {
+	case retryableORACode(code):
+		return &WriteError{Err: err, Code: code, Retryable: true}
+	case rowDataORACodes[code]:
+		return &WriteError{Err: err, Code: code, RowData: true}
+	default:
+		return &WriteError{Err: err, Code: code}
+	}
 }
 
-// WriteError 携带 ORA 错误码的分类错误。
+// WriteError 携带 ORA 错误码的三态分类错误（见 classify）。
 type WriteError struct {
-	Err       error
-	Code      int
+	Err  error
+	Code int
+	// Retryable=true：暂时性错误（网络/锁/ctx 取消），整批退避重放。
 	Retryable bool
+	// RowData=true：行级数据错误（白名单 ORA 码），跳行 + DLQ + 前进 offset。
+	// 两者皆 false：fatal（配置/权限/未知），中止任务、不前进 offset。
+	RowData bool
 }
 
 func (e *WriteError) Error() string { return e.Err.Error() }
 func (e *WriteError) Unwrap() error { return e.Err }
+
+// IsRetryable 实现 sink.IsRetryable 的标记方法。
+func (e *WriteError) IsRetryable() bool { return e.Retryable }
+
+// IsRowData 实现 sink.IsRowData 的标记方法。
+func (e *WriteError) IsRowData() bool { return e.RowData }
 
 // oraErrorCode 提取 ORA-xxxxx 错误码，无则 0。
 func oraErrorCode(err error) int {

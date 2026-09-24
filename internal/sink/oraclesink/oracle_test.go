@@ -1,6 +1,7 @@
 package oraclesink
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -128,14 +129,24 @@ func TestOraErrorCode(t *testing.T) {
 	}
 }
 
-// TestClassify 失败分类契约（P0#1）：可重试（网络/锁）vs 数据错误（DLQ）。
+// TestClassify 三态失败分类契约（M1.5 跟进复审 P1#1）：
+// retryable（网络/锁/ctx 取消）/ row-data（白名单 ORA 码）/ fatal（默认）。
 func TestClassify(t *testing.T) {
+	// retryable：网络/锁类 ORA 码 + ctx 取消/超时（P1#2 修正后的码表）
 	retryable := []error{
 		errors.New("ORA-12170: TNS:Connect timeout occurred"),
 		errors.New("ORA-00054: resource busy and acquire with NOWAIT specified"),
-		errors.New("ORA-00031: session marked for kill"),
+		errors.New("ORA-00060: deadlock detected while waiting for resource"),
+		errors.New("ORA-01013: user requested cancel of current operation"),
+		errors.New("ORA-04021: timeout occurred while waiting to lock object"),
 		errors.New("ORA-03113: end-of-file on communication channel"),
-		errors.New("dial tcp: connection refused"), // 无 ORA 码 → 驱动级按暂时性
+		errors.New("ORA-03135: connection lost contact"),
+		errors.New("ORA-12543: TNS:destination host unreachable"),
+		errors.New("ORA-12570: TNS:packet reader failure"),
+		context.Canceled,
+		context.DeadlineExceeded,
+		fmt.Errorf("write batch: %w", context.Canceled), // 包装后仍可识别
+		sql.ErrTxDone, // ctx 取消与自动回滚的竞态残留（真库实测）
 	}
 	for _, err := range retryable {
 		got := classify(err)
@@ -146,13 +157,19 @@ func TestClassify(t *testing.T) {
 		if !we.Retryable {
 			t.Errorf("classify(%v).Retryable = false, want true", err)
 		}
+		if we.RowData {
+			t.Errorf("classify(%v).RowData = true, want false", err)
+		}
 		if !errors.Is(got, err) {
 			t.Errorf("classify(%v) must unwrap to original", err)
 		}
 	}
+	// row-data：白名单 ORA 码 → 跳行 + DLQ + 前进 offset
 	dataErrors := []error{
 		errors.New("ORA-00001: unique constraint violated"),
 		errors.New("ORA-01722: invalid number"),
+		errors.New("ORA-01400: cannot insert NULL into mandatory column"),
+		errors.New("ORA-01861: literal does not match format string"),
 		errors.New("ORA-12899: value too large for column"),
 	}
 	for _, err := range dataErrors {
@@ -161,12 +178,31 @@ func TestClassify(t *testing.T) {
 		if !errors.As(got, &we) {
 			t.Fatalf("classify must return *WriteError, got %T", got)
 		}
-		if we.Retryable {
-			t.Errorf("classify(%v).Retryable = true, want false", err)
+		if we.Retryable || !we.RowData {
+			t.Errorf("classify(%v) = retryable=%v rowdata=%v, want row-data", err, we.Retryable, we.RowData)
+		}
+	}
+	// fatal：配置/权限/未知（表不存在、非法标识符、权限不足、旧码表误纳的
+	// ORA-00031、无 ORA 码的驱动错误）→ 中止任务、不前进 offset
+	fatal := []error{
+		errors.New("ORA-00942: table or view does not exist"),
+		errors.New("ORA-00904: invalid identifier"),
+		errors.New("ORA-01031: insufficient privileges"),
+		errors.New("ORA-00031: session marked for kill"), // P1#2：不在重试码表
+		errors.New("dial tcp: connection refused"),        // 无 ORA 码且非 ctx → fatal
+	}
+	for _, err := range fatal {
+		got := classify(err)
+		var we *WriteError
+		if !errors.As(got, &we) {
+			t.Fatalf("classify must return *WriteError, got %T", got)
+		}
+		if we.Retryable || we.RowData {
+			t.Errorf("classify(%v) = retryable=%v rowdata=%v, want fatal", err, we.Retryable, we.RowData)
 		}
 	}
 
-	// 本地绑定/转换错误走 dataError：数据错误，非可重试
+	// 本地绑定/转换错误走 dataError：行级数据错误
 	localErrors := []error{
 		fmt.Errorf("cannot parse datetime value %q", "bad"),
 		fmt.Errorf("decode base64 binary value: illegal base64 data"),
@@ -178,8 +214,11 @@ func TestClassify(t *testing.T) {
 		if !errors.As(got, &we) {
 			t.Fatalf("dataError must return *WriteError, got %T", got)
 		}
-		if we.Retryable {
-			t.Errorf("dataError(%v).Retryable = true, want false", err)
+		if we.Retryable || !we.RowData {
+			t.Errorf("dataError(%v) = retryable=%v rowdata=%v, want row-data", err, we.Retryable, we.RowData)
+		}
+		if !errors.Is(got, err) {
+			t.Errorf("dataError(%v) must unwrap to original", err)
 		}
 	}
 }
