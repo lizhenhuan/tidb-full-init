@@ -224,11 +224,51 @@ type statusColumnInfo struct {
 		O string `json:"O"`
 		L string `json:"L"`
 	} `json:"name"`
-	State string `json:"state"`
+	State statusColumnState `json:"state"`
 }
 
 type statusTableInfo struct {
 	Columns []statusColumnInfo `json:"cols"`
+}
+
+// statusColumnState 兼容各版本 status API 的列状态形态（L5）：TiDB v8.5.8
+// 实测返回数字（public=5，即 model.StatePublic），另有构建给字符串
+// （"public"），232 端则整体省略该字段。字段缺省的零值视为 public
+// （information_schema 只暴露 public 列，名字对不上会走全有或全无兜底）。
+type statusColumnState int8
+
+const (
+	stateUnset     statusColumnState = 0  // wire 上省略
+	statePublicNum statusColumnState = 5  // TiDB model.StatePublic
+	stateNonPublic statusColumnState = -1 // 明确非 public 的字符串形态
+)
+
+func (s *statusColumnState) UnmarshalJSON(b []byte) error {
+	t := strings.TrimSpace(string(b))
+	if t == "" || t == "null" {
+		*s = stateUnset
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err == nil {
+		*s = statusColumnState(n)
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err == nil {
+		if strings.EqualFold(str, "public") {
+			*s = statePublicNum
+		} else {
+			*s = stateNonPublic
+		}
+		return nil
+	}
+	*s = stateUnset
+	return nil
+}
+
+func (s statusColumnState) isPublic() bool {
+	return s == stateUnset || s == statePublicNum
 }
 
 // applyRealColumnIDs 用 status API 的真实列 ID 覆盖 columns 里的序号
@@ -264,7 +304,7 @@ func (sf *SchemaFetcher) applyRealColumnIDs(database, tableName string, columns 
 	byName := make(map[string]int64, len(ti.Columns))
 	for _, c := range ti.Columns {
 		// 只认 public 列（DDL 中间态列不参与解码）。
-		if c.State != "" && !strings.EqualFold(c.State, "public") {
+		if !c.State.isPublic() {
 			continue
 		}
 		name := c.Name.O

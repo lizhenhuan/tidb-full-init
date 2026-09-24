@@ -61,6 +61,43 @@ func TestApplyRealColumnIDsAllOrNothing(t *testing.T) {
 	}
 }
 
+// L5：TiDB v8.5.8 的 status API 列状态是数字（public=5），另有构建给
+// 字符串、232 端省略——三种形态都要兼容，非 public 数字（DDL 中间态）跳过。
+func TestApplyRealColumnIDsNumericState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"cols":[
+			{"id":1,"name":{"O":"id","L":"id"},"state":5},
+			{"id":4,"name":{"O":"c","L":"c"},"state":2},
+			{"id":3,"name":{"O":"b","L":"b"},"state":"public"}
+		]}`)
+	}))
+	defer srv.Close()
+
+	// 只有 public 列可命中；state=2（write only）的列 c 对不上 → 整体失败。
+	sf := &SchemaFetcher{statusURL: srv.URL}
+	c := cols("id", "b", "c")
+	if err := sf.applyRealColumnIDs("db1", "t1", c); err == nil {
+		t.Fatal("non-public column must be skipped and fail all-or-nothing")
+	}
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"cols":[
+			{"id":1,"name":{"O":"id","L":"id"},"state":5},
+			{"id":3,"name":{"O":"b","L":"b"},"state":"public"},
+			{"id":4,"name":{"O":"zz","L":"zz"},"state":2}
+		]}`)
+	}))
+	defer srv2.Close()
+	sf2 := &SchemaFetcher{statusURL: srv2.URL}
+	c2 := cols("id", "b")
+	if err := sf2.applyRealColumnIDs("db1", "t1", c2); err != nil {
+		t.Fatalf("numeric public state must work: %v", err)
+	}
+	if c2[0].ID != 1 || c2[1].ID != 3 {
+		t.Fatalf("IDs = [%d %d], want [1 3]", c2[0].ID, c2[1].ID)
+	}
+}
+
 func TestApplyRealColumnIDsErrors(t *testing.T) {
 	sf := &SchemaFetcher{statusURL: ""}
 	if err := sf.applyRealColumnIDs("db1", "t1", cols("id")); err == nil {

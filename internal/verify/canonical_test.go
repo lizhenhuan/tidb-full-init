@@ -35,6 +35,12 @@ func TestCanonicalCrossDialect(t *testing.T) {
 		{"time-string", KindTime, "2026-09-24 10:30:05.123456", oracleDT, "2026-09-24 10:30:05.123456"},
 		// 日期：Oracle DATE（时间部分丢弃，映射约定）
 		{"date", KindDate, mk, mk, "2026-09-24"},
+		// 单精度浮点（L6）：两侧统一 32 位精度——float32 直读、驱动
+		// 拓宽成 float64、文本协议三种形态必须同 canonical。
+		{"float32-direct", KindFloat32, float32(1.1), float32(1.1), "11/10"},
+		{"float32-widened-f64", KindFloat32, float64(float32(1.1)), float32(1.1), "11/10"},
+		{"float32-text", KindFloat32, []byte("1.1"), float32(1.1), "11/10"},
+		{"float32-int-val", KindFloat32, float32(3), float64(3), "3"},
 		// NULL
 		{"null", KindString, nil, nil, nullSentinel},
 		// 字符串
@@ -72,11 +78,27 @@ func TestCanonicalNumberRejects(t *testing.T) {
 	}
 }
 
+// 精度隔离（L6）：KindFloat（BINARY_DOUBLE）保持 64 位精度不被 32 位
+// 圆整吞掉，否则真差异会被错判相等。
+func TestCanonicalFloatPrecisionSeparation(t *testing.T) {
+	full, err := canonical(float64(1.100000023841858), KindFloat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow, err := canonical(float64(float32(1.1)), KindFloat32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full == narrow {
+		t.Fatalf("KindFloat must preserve 64-bit precision: both = %q", full)
+	}
+}
+
 func TestKindInference(t *testing.T) {
 	for mt, want := range map[string]Kind{
 		"bigint": KindInt, "int unsigned": KindInt, "tinyint(1)": KindInt,
 		"decimal(10,2)": KindDecimal, "numeric(5)": KindDecimal,
-		"float": KindFloat, "double": KindFloat,
+		"float": KindFloat32, "double": KindFloat,
 		"datetime": KindTime, "datetime(6)": KindTime, "timestamp": KindTime,
 		"date": KindDate, "binary(16)": KindBytes, "blob": KindBytes,
 		"varchar(64)": KindString, "text": KindString,
@@ -97,6 +119,7 @@ func TestKindInference(t *testing.T) {
 		{"NUMBER", &zero, KindInt},
 		{"FLOAT", nil, KindFloat},
 		{"BINARY_DOUBLE", nil, KindFloat},
+		{"BINARY_FLOAT", nil, KindFloat32},
 		{"TIMESTAMP(6)", nil, KindTime},
 		{"DATE", nil, KindDate},
 		{"VARCHAR2", nil, KindString},

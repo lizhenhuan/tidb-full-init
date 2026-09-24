@@ -26,10 +26,15 @@ const (
 	KindString Kind = iota
 	KindInt
 	KindDecimal // 定点数（MySQL DECIMAL / Oracle NUMBER 带小数）
-	KindFloat   // 浮点（FLOAT/BINARY_DOUBLE；按最短十进制表示比较）
+	KindFloat   // 双精度浮点（MySQL DOUBLE / Oracle BINARY_DOUBLE；64 位最短十进制）
 	KindTime    // datetime/timestamp（秒级以下尾零截断）
 	KindDate    // 纯日期（Oracle DATE 仅承载 MySQL date，时间部分丢弃）
 	KindBytes   // 二进制（base64）
+	// KindFloat32 单精度浮点（MySQL FLOAT / Oracle BINARY_FLOAT）。
+	// 两侧统一按 32 位精度归一后比较（L6）：float32 值被驱动拓宽成
+	// float64 时，64 位最短表示会带出伪精度（1.1 → 1.100000023841858），
+	// 与对端 float32 直接假 DIFF。
+	KindFloat32
 )
 
 // nullSentinel NULL 的规范化表示（与空串区分）。
@@ -48,8 +53,10 @@ func mysqlKind(mysqlType string) Kind {
 		return KindInt
 	case strings.Contains(t, "decimal") || strings.Contains(t, "numeric"):
 		return KindDecimal
-	case strings.Contains(t, "float") || strings.Contains(t, "double"):
+	case strings.Contains(t, "double") || strings.Contains(t, "real"):
 		return KindFloat
+	case strings.Contains(t, "float"):
+		return KindFloat32
 	case strings.HasPrefix(t, "datetime") || strings.HasPrefix(t, "timestamp"):
 		return KindTime
 	case strings.HasPrefix(t, "date"):
@@ -72,7 +79,9 @@ func oracleKind(dataType string, scale *int) Kind {
 			return KindDecimal
 		}
 		return KindInt
-	case strings.HasPrefix(t, "FLOAT") || strings.HasPrefix(t, "BINARY_DOUBLE") || strings.HasPrefix(t, "BINARY_FLOAT"):
+	case strings.HasPrefix(t, "BINARY_FLOAT"):
+		return KindFloat32
+	case strings.HasPrefix(t, "FLOAT") || strings.HasPrefix(t, "BINARY_DOUBLE"):
 		return KindFloat
 	case strings.HasPrefix(t, "TIMESTAMP"):
 		return KindTime
@@ -93,7 +102,7 @@ func canonical(v any, k Kind) (string, error) {
 		return nullSentinel, nil
 	}
 	switch k {
-	case KindInt, KindDecimal, KindFloat:
+	case KindInt, KindDecimal, KindFloat, KindFloat32:
 		return canonicalNumber(v, k)
 	case KindTime:
 		return canonicalTime(v, time.DateTime+".999999999")
@@ -115,9 +124,18 @@ func canonicalNumber(v any, k Kind) (string, error) {
 		s = strconv.Itoa(n)
 	case uint64:
 		s = strconv.FormatUint(n, 10)
+	case float32:
+		s = strconv.FormatFloat(float64(n), 'f', -1, 32)
 	case float64:
-		// 最短往返表示：float64(123.45) → "123.45"，与 MySQL DECIMAL 文本一致
-		s = strconv.FormatFloat(n, 'f', -1, 64)
+		if k == KindFloat32 {
+			// FLOAT/BINARY_FLOAT 列（L6）：驱动可能给 float64（float32
+			// 值的拓宽表示），统一圆整回 32 位再取最短表示，与对端
+			// float32 同口径。
+			s = strconv.FormatFloat(float64(float32(n)), 'f', -1, 32)
+		} else {
+			// 最短往返表示：float64(123.45) → "123.45"，与 MySQL DECIMAL 文本一致
+			s = strconv.FormatFloat(n, 'f', -1, 64)
+		}
 	case []byte:
 		s = string(n)
 	case string:
@@ -126,6 +144,12 @@ func canonicalNumber(v any, k Kind) (string, error) {
 		return "", fmt.Errorf("verify: cannot canonicalize %T as number", v)
 	}
 	s = strings.TrimSpace(s)
+	if k == KindFloat32 {
+		// 文本协议路径（[]byte/string）同样过 32 位圆整，保证两侧同精度。
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			s = strconv.FormatFloat(float64(float32(f)), 'f', -1, 32)
+		}
+	}
 	if s == "" {
 		return "", fmt.Errorf("verify: empty number string")
 	}
