@@ -213,9 +213,12 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 func (s *Sink) Close() error { return s.db.Close() }
 
 // bindRowArgs 构造 MERGE 命名参数（含类型转换：Base64→RAW/BLOB 等）。
+// 绑定名用 oracle.BindName(i)（#t16）：与列名解耦，列名为 Oracle 保留字
+// （number/date/raw…）时 `:number` 触发 ORA-01745，整表 0 行落库；
+// 序号与 RenderUpsert 的 meta.Columns 枚举序一一对应。
 func (s *Sink) bindRowArgs(meta *model.TableMeta, ev *model.RowEvent) ([]any, error) {
 	args := make([]any, 0, len(meta.Columns))
-	for _, col := range meta.Columns {
+	for i, col := range meta.Columns {
 		raw, ok := ev.After[col.Name]
 		if !ok {
 			return nil, fmt.Errorf("event missing column %q for %s.%s", col.Name, ev.Database, ev.Table)
@@ -224,16 +227,20 @@ func (s *Sink) bindRowArgs(meta *model.TableMeta, ev *model.RowEvent) ([]any, er
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, sql.Named(col.Name, v))
+		args = append(args, sql.Named(oracle.BindName(i), v))
 	}
 	return args, nil
 }
 
 // bindPKArgs 构造 DELETE 的 PK 命名参数，并按列 MySQL 类型做与行写入
 // 一致的显式转换（P0#2：日期类 PK 不能依赖 Oracle 隐式转换）。
+// 绑定名 oracle.BindName(i)（#t16 同根因），序号与 RenderDelete 的
+// PKNames 枚举序对应。
 func (s *Sink) bindPKArgs(meta *model.TableMeta, ev *model.RowEvent, useOld bool) ([]any, error) {
-	args := make([]any, 0, len(ev.PKNames))
-	for _, pk := range ev.PKNames {
+	// 枚举 meta.PKNames 而非 ev.PKNames：绑定序必须与 RenderDelete 的
+	// 枚举序严格一致（#t16 序号绑定），事件侧顺序无从保证。
+	args := make([]any, 0, len(meta.PKNames))
+	for i, pk := range meta.PKNames {
 		raw, ok := ev.After[pk]
 		if useOld {
 			if old, ok2 := ev.Before[pk]; ok2 {
@@ -247,7 +254,7 @@ func (s *Sink) bindPKArgs(meta *model.TableMeta, ev *model.RowEvent, useOld bool
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, sql.Named(pk, v))
+		args = append(args, sql.Named(oracle.BindName(i), v))
 	}
 	return args, nil
 }

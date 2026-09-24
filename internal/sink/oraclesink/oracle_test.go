@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	oracle "github.com/lizhenhuan/tidb-full-init/internal/dialect/oracle"
 	"github.com/lizhenhuan/tidb-full-init/internal/model"
 )
 
@@ -236,6 +237,43 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestBindRowArgsOrdinalNames #t16：绑定名与列名解耦——保留字列
+// （number/date/raw…）的绑定名仍是 b0..bn，与 RenderUpsert 枚举序一致。
+func TestBindRowArgsOrdinalNames(t *testing.T) {
+	s := &Sink{}
+	meta := model.TableMeta{
+		Database: "db1", Table: "drivers",
+		Columns: []model.ColumnMeta{
+			{Name: "driverId", MySQLType: "bigint", IsPK: true},
+			{Name: "number", MySQLType: "varchar(16)"},
+			{Name: "date", MySQLType: "datetime"},
+		},
+		PKNames: []string{"driverId"},
+	}
+	ev := model.RowEvent{Op: model.OpInsert, Database: "db1", Table: "drivers",
+		After: map[string]string{"driverId": "1", "number": "44", "date": "2024-01-02 03:04:05"}}
+	args, err := s.bindRowArgs(&meta, &ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, a := range args {
+		na, ok := a.(sql.NamedArg)
+		if !ok {
+			t.Fatalf("want sql.NamedArg, got %T", a)
+		}
+		if na.Name != oracle.BindName(i) {
+			t.Fatalf("arg %d name = %s, want %s", i, na.Name, oracle.BindName(i))
+		}
+	}
+	// 值按列序取：number=44、date=time.Time
+	if args[1].(sql.NamedArg).Value != "44" {
+		t.Errorf("number bind value = %#v, want \"44\"", args[1].(sql.NamedArg).Value)
+	}
+	if _, ok := args[2].(sql.NamedArg).Value.(time.Time); !ok {
+		t.Errorf("date bind value = %#v, want time.Time", args[2].(sql.NamedArg).Value)
+	}
+}
+
 // TestBindPKArgsConversion PK 绑定同样走显式转换（日期 PK 不能依赖隐式转换）。
 func TestBindPKArgsConversion(t *testing.T) {
 	s := &Sink{}
@@ -267,12 +305,13 @@ func TestBindPKArgsConversion(t *testing.T) {
 		}
 		named[na.Name] = na.Value
 	}
-	if v, ok := named["id"].(string); !ok || v != "7" {
-		t.Errorf("old PK id: want string 7, got %#v", named["id"])
+	// #t16：绑定名 = BindName(i)，序号与 meta.PKNames 枚举序一致
+	if v, ok := named[oracle.BindName(0)].(string); !ok || v != "7" {
+		t.Errorf("old PK id: want string 7, got %#v", named[oracle.BindName(0)])
 	}
 	wantT := time.Date(2023, 12, 31, 23, 59, 59, 0, time.UTC)
-	if v, ok := named["created_at"].(time.Time); !ok || !v.Equal(wantT) {
-		t.Errorf("old PK created_at: want %v as time.Time, got %#v", wantT, named["created_at"])
+	if v, ok := named[oracle.BindName(1)].(time.Time); !ok || !v.Equal(wantT) {
+		t.Errorf("old PK created_at: want %v as time.Time, got %#v", wantT, named[oracle.BindName(1)])
 	}
 
 	// useOld=false → 取 After 镜像
@@ -282,7 +321,7 @@ func TestBindPKArgsConversion(t *testing.T) {
 	}
 	for _, a := range args {
 		na := a.(sql.NamedArg)
-		if na.Name == "created_at" {
+		if na.Name == oracle.BindName(1) {
 			if v, ok := na.Value.(time.Time); !ok || !v.Equal(time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)) {
 				t.Errorf("new PK created_at: got %#v", na.Value)
 			}

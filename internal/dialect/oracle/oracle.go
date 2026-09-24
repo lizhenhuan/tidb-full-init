@@ -34,6 +34,14 @@ func NewWithIdentLimit(maxIdent int) *Dialect {
 // DefaultMaxIdentLen Oracle 传统标识符上限（12.2 之前为 30）。
 const DefaultMaxIdentLen = 30
 
+// BindName MERGE/DELETE 命名绑定变量的统一命名（#t16）：按语句内出现
+// 顺序编号 b0、b1…，与列名彻底解耦——列名可为 Oracle 保留字
+// （number/date/raw…），`:number` 形态会被判非法主机/绑定变量名
+// （ORA-01745），整表 0 行落库且不进 DLQ（consume 超时）。绑定序与
+// RenderUpsert 的 meta.Columns 枚举序、RenderDelete 的 PKNames 枚举序
+// 一一对应，oraclesink 的 bindRowArgs/bindPKArgs 按同一序取值。
+func BindName(i int) string { return "b" + strconv.Itoa(i) }
+
 // MaxIdentLen 返回当前生效的标识符上限（ddl-sync 记录进报告供验收首查）。
 func (d *Dialect) MaxIdentLen() int { return d.maxIdentLen }
 
@@ -318,7 +326,7 @@ func (d *Dialect) RenderCreateTable(meta model.TableMeta) (string, error) {
 }
 
 // RenderUpsert 生成按 PK 的 MERGE INTO 幂等 upsert（设计文档 D2）。
-// 绑定变量按列名命名，支持 go-ora 命名参数。
+// 绑定变量按列序号命名（BindName，#t16），与列名解耦。
 func (d *Dialect) RenderUpsert(meta model.TableMeta) (string, error) {
 	if err := d.ValidateTable(meta); err != nil {
 		return "", err
@@ -327,7 +335,7 @@ func (d *Dialect) RenderUpsert(meta model.TableMeta) (string, error) {
 	var src, on, set, cols, vals strings.Builder
 	for i, col := range meta.Columns {
 		c := d.QuoteIdentifier(col.Name)
-		b := ":" + col.Name
+		b := ":" + BindName(i)
 		comma := ","
 		if i == len(meta.Columns)-1 {
 			comma = ""
@@ -356,6 +364,7 @@ func (d *Dialect) RenderUpsert(meta model.TableMeta) (string, error) {
 }
 
 // RenderDelete 生成按 PK 的删除语句（目标行不存在不视为错误，D2）。
+// 绑定变量按 PK 序号命名（BindName，#t16），与列名解耦。
 func (d *Dialect) RenderDelete(meta model.TableMeta) (string, error) {
 	if err := d.ValidateTable(meta); err != nil {
 		return "", err
@@ -366,7 +375,7 @@ func (d *Dialect) RenderDelete(meta model.TableMeta) (string, error) {
 		if i == len(meta.PKNames)-1 {
 			comma = ""
 		}
-		fmt.Fprintf(&where, "%s = :%s%s", d.QuoteIdentifier(pk), pk, comma)
+		fmt.Fprintf(&where, "%s = :%s%s", d.QuoteIdentifier(pk), BindName(i), comma)
 	}
 	return fmt.Sprintf("DELETE FROM %s WHERE %s", d.qualified(meta), where.String()), nil
 }

@@ -182,9 +182,9 @@ func TestRenderUpsert(t *testing.T) {
 		"WHEN MATCHED THEN UPDATE SET",
 		"WHEN NOT MATCHED THEN INSERT",
 		"t.\"id\" = s.\"id\"",
-		":id",
-		":amount",
-		":memo",
+		":b0",
+		":b1",
+		":b2",
 	} {
 		if !strings.Contains(sqlStr, want) {
 			t.Errorf("upsert missing %q:\n%s", want, sqlStr)
@@ -194,6 +194,50 @@ func TestRenderUpsert(t *testing.T) {
 	if strings.Contains(sqlStr, `t."id" = s."id",`) {
 		t.Errorf("upsert should not set PK column:\n%s", sqlStr)
 	}
+	// #t16：绑定变量不得复用列名（保留字列 → ORA-01745）
+	for _, col := range []string{"id", "amount", "memo"} {
+		if strings.Contains(sqlStr, ":"+col) {
+			t.Errorf("upsert must not embed column-name bind :%s:\n%s", col, sqlStr)
+		}
+	}
+}
+
+// TestRenderBindNamesReservedColumns #t16 钉子：列名为 Oracle 保留字
+// （number/date/raw——prisma 真实表实测 ORA-01745 整表 0 行）时，
+// MERGE/DELETE 的绑定变量仍为 b0..bn，与列名彻底解耦。
+func TestRenderBindNamesReservedColumns(t *testing.T) {
+	d := oracle.New()
+	meta := model.TableMeta{
+		Database: "db1", Table: "drivers",
+		Columns: []model.ColumnMeta{
+			{Name: "driverId", MySQLType: "bigint", IsPK: true},
+			{Name: "number", MySQLType: "varchar(16)"},
+			{Name: "date", MySQLType: "datetime"},
+			{Name: "raw", MySQLType: "blob"},
+		},
+		PKNames: []string{"driverId"},
+	}
+	upsert, err := d.RenderUpsert(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del, err := d.RenderDelete(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{upsert, del} {
+		for _, reserved := range []string{"number", "date", "raw"} {
+			if strings.Contains(s, ":"+reserved) {
+				t.Errorf("reserved-word bind :%s leaks into SQL:\n%s", reserved, s)
+			}
+		}
+	}
+	if !strings.Contains(upsert, ":b1") || !strings.Contains(upsert, ":b3") {
+		t.Errorf("upsert must use ordinal binds b0..bn:\n%s", upsert)
+	}
+	if !strings.Contains(del, `"driverId" = :b0`) {
+		t.Errorf("delete must use ordinal bind for PK:\n%s", del)
+	}
 }
 
 func TestRenderDelete(t *testing.T) {
@@ -202,7 +246,7 @@ func TestRenderDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	want := `DELETE FROM "shop"."orders" WHERE "id" = :id`
+	want := `DELETE FROM "shop"."orders" WHERE "id" = :b0`
 	if sqlStr != want {
 		t.Errorf("delete = %s, want %s", sqlStr, want)
 	}
@@ -210,7 +254,7 @@ func TestRenderDelete(t *testing.T) {
 	composite := testMeta()
 	composite.PKNames = []string{"a", "b"}
 	sqlStr, _ = d.RenderDelete(composite)
-	if !strings.Contains(sqlStr, `"a" = :a AND "b" = :b`) {
+	if !strings.Contains(sqlStr, `"a" = :b0 AND "b" = :b1`) {
 		t.Errorf("composite PK delete wrong: %s", sqlStr)
 	}
 }

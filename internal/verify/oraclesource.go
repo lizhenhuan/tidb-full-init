@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	goorav2 "github.com/sijms/go-ora/v2"
@@ -107,10 +108,14 @@ func (s *OracleSource) qualified() string {
 	return s.q(s.schema) + "." + s.q(s.table)
 }
 
+// colList SELECT 列表：每列带唯一别名 c0..cn（#t17）。池内真实表存在
+// 大小写不敏感重复列名（awards_coaches/PEOPLE，如 COACHID 与 coachid
+// 两列并存），裸列名 SELECT 会在选择列表出现重名 → ORA-00960 整表
+// 无法比对；别名后列表唯一，行扫描按位置不受影响。
 func (s *OracleSource) colList() string {
 	qs := make([]string, len(s.cols))
 	for i, c := range s.cols {
-		qs[i] = s.q(c.Name)
+		qs[i] = s.q(c.Name) + " AS c" + strconv.Itoa(i)
 	}
 	return strings.Join(qs, ",")
 }
