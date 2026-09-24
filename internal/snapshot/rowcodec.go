@@ -620,7 +620,9 @@ func decodeDecimal(data []byte) string {
 	intStr := string(intDigits[intStart:])
 
 	// Build result
-	if isNegative && intStr != "0" {
+	// L9：符号条件是「值非零」，不是「整数部分非零」——-1<x<0 的负小数
+	// 整数位是 0 但值非零，原判断会吞掉负号（-1e-30 落库成 +1e-30）。
+	if isNegative && (intStr != "0" || strings.ContainsAny(string(fracDigits), "123456789")) {
 		intStr = "-" + intStr
 	}
 

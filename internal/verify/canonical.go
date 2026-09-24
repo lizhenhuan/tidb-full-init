@@ -35,6 +35,11 @@ const (
 	// float64 时，64 位最短表示会带出伪精度（1.1 → 1.100000023841858），
 	// 与对端 float32 直接假 DIFF。
 	KindFloat32
+	// KindBit 位串（MySQL BIT → Oracle NUMBER，dialect 数值映射）。
+	// 文本协议给大端位串 []byte、二进制协议给 uint64，按无符号整数
+	// 归一，与对端 NUMBER 的 KindInt canonical 天然一致（L10：此前误判
+	// KindBytes 走 base64，与 NUMBER 必然假 DIFF）。
+	KindBit
 )
 
 // nullSentinel NULL 的规范化表示（与空串区分）。
@@ -61,6 +66,10 @@ func mysqlKind(mysqlType string) Kind {
 		return KindTime
 	case strings.HasPrefix(t, "date"):
 		return KindDate
+	case strings.HasPrefix(t, "bit"):
+		// BIT 在 encoder.IsBinaryType 里也命中，必须先于 KindBytes 判：
+		// dialect 把 BIT 映射为 Oracle NUMBER（数值语义，L10）。
+		return KindBit
 	case encoder.IsBinaryType(t):
 		return KindBytes
 	default:
@@ -102,7 +111,7 @@ func canonical(v any, k Kind) (string, error) {
 		return nullSentinel, nil
 	}
 	switch k {
-	case KindInt, KindDecimal, KindFloat, KindFloat32:
+	case KindInt, KindDecimal, KindFloat, KindFloat32, KindBit:
 		return canonicalNumber(v, k)
 	case KindTime:
 		return canonicalTime(v, time.DateTime+".999999999")
@@ -137,7 +146,17 @@ func canonicalNumber(v any, k Kind) (string, error) {
 			s = strconv.FormatFloat(n, 'f', -1, 64)
 		}
 	case []byte:
-		s = string(n)
+		if k == KindBit {
+			// BIT 文本协议给大端位串（bit(16)=0x0100）→ 无符号整数；
+			// 不可走 string(n)：裸字节进 big.Rat 必然报错/脏值（L10）。
+			var u uint64
+			for _, b := range n {
+				u = u<<8 | uint64(b)
+			}
+			s = strconv.FormatUint(u, 10)
+		} else {
+			s = string(n)
+		}
 	case string:
 		s = n
 	default:

@@ -41,6 +41,11 @@ func TestCanonicalCrossDialect(t *testing.T) {
 		{"float32-widened-f64", KindFloat32, float64(float32(1.1)), float32(1.1), "11/10"},
 		{"float32-text", KindFloat32, []byte("1.1"), float32(1.1), "11/10"},
 		{"float32-int-val", KindFloat32, float32(3), float64(3), "3"},
+		// BIT（L10）：MySQL 侧大端位串/uint64，Oracle NUMBER int64——按
+		// 无符号整数归一，不再走 base64 假 DIFF。
+		{"bit-bytes", KindBit, []byte{0x01, 0x00}, int64(256), "256"},
+		{"bit-zero", KindBit, []byte{0x00, 0x00}, "0", "0"},
+		{"bit-uint64", KindBit, uint64(65535), int64(65535), "65535"},
 		// NULL
 		{"null", KindString, nil, nil, nullSentinel},
 		// 字符串
@@ -100,7 +105,8 @@ func TestKindInference(t *testing.T) {
 		"decimal(10,2)": KindDecimal, "numeric(5)": KindDecimal,
 		"float": KindFloat32, "double": KindFloat,
 		"datetime": KindTime, "datetime(6)": KindTime, "timestamp": KindTime,
-		"date": KindDate, "binary(16)": KindBytes, "blob": KindBytes,
+		"date": KindDate, "bit(16)": KindBit, "bit": KindBit,
+		"binary(16)": KindBytes, "blob": KindBytes,
 		"varchar(64)": KindString, "text": KindString,
 	} {
 		if got := mysqlKind(mt); got != want {

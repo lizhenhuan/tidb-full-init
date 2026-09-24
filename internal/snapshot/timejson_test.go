@@ -68,8 +68,7 @@ func TestDecodePackedTimeTimestampTZ(t *testing.T) {
 
 // L8c：JSON 文本输出对齐 TiDB json String()（", " 与 ": "），
 // 驱动读出的带空格文本与快照输出逐字节一致。
-func TestDecoderJSONSpacing(t *testing.T) {
-	// {"a": null, "b": true}
+func TestDecoderJSONSpacing(t *testing.T) {	// {"a": null, "b": true}
 	obj := make([]byte, 0, 32)
 	obj = binary.LittleEndian.AppendUint32(obj, 2) // count
 	obj = binary.LittleEndian.AppendUint32(obj, 40) // totalSize（解码器不读）
@@ -91,5 +90,27 @@ func TestDecoderJSONSpacing(t *testing.T) {
 	arr = append(arr, jsonTypeCodeLiteral, 1, 0, 0, 0)
 	if got := string(decodeBinaryJSONWithType(jsonTypeCodeArray, arr)); got != `[null, true]` {
 		t.Fatalf("array = %q", got)
+	}
+}
+
+// L9：decimal(2,1) 的 -0.1——整数位为 0 的负小数符号不能丢
+// （-1e-30 曾落库成 +1e-30）。
+func TestDecodeDecimalNegativeSmall(t *testing.T) {
+	// precision=2, frac=1；值字 0x00(整数位),0x01(小数位)。
+	// 负数编码：全字节 XOR 0xFF 后首字节翻转 bit7：
+	//   [0x00,0x01] → XOR FF → [0xFF,0xFE] → ^0x80 → [0x7F,0xFE]
+	neg := decodeDecimal([]byte{0x02, 0x01, 0x7F, 0xFE})
+	if neg != "-0.1" {
+		t.Fatalf("negative small decimal = %q, want -0.1", neg)
+	}
+	// 正数：原样后首字节 ^0x80：[0x00,0x01] → [0x80,0x01]
+	pos := decodeDecimal([]byte{0x02, 0x01, 0x80, 0x01})
+	if pos != "0.1" {
+		t.Fatalf("positive small decimal = %q, want 0.1", pos)
+	}
+	// 负零不带符号（"0.0"；canonical 侧负零亦归一为 0）。
+	negZero := decodeDecimal([]byte{0x02, 0x01, 0x7F, 0xFF})
+	if negZero != "0.0" {
+		t.Fatalf("negative zero = %q, want 0.0", negZero)
 	}
 }
