@@ -166,8 +166,8 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 			}
 			fmt.Fprintf(&sb, "  ,CONSTRAINT %s UNIQUE (%s)\n",
 				// Oracle 约束名 schema 全局：MySQL 约束名仅表内唯一，跨表
-			// 同名（role_id 等）→ ORA-02264，UK 名纳入表名限定
-			d.QuoteIdentifier(fitIdent(d, "UK_"+meta.Table+"_"+uk.Name)), strings.Join(colsUK, ", "))
+				// 同名（role_id 等）→ ORA-02264，UK 名纳入表名限定
+				d.QuoteIdentifier(fitIdent(d, "UK_"+meta.Table+"_"+uk.Name)), strings.Join(colsUK, ", "))
 		}
 		sb.WriteString(")")
 		stmts = append(stmts, Statement{Kind: "create", SQL: sb.String()})
