@@ -36,6 +36,13 @@ type Options struct {
 	ChunkSize   int // 分块大小（分块 checksum 的报告粒度，默认 1000）
 	MaxRowDiffs int // 行级差异最多展开数（默认 50；其余只计数）
 	MaxPKs      int // 缺失/多余主键最多展开数（默认 50）
+
+	// EmptyStringAsNull 把 canonical "" 与 NULL 判等（K2，TiDB↔Oracle
+	// 比对必开）：Oracle 空串即 NULL，源端 '' 写入目标后物理不可区分
+	// （管道 convertValue ""→nil 与 Oracle 语义双重决定）。双向归一后
+	// 不可能产生假 PASS——目标端不存在能区分 '' 与 NULL 的状态。
+	// TiDB↔TiDB 镜像比对保持默认关闭（'' 与 NULL 仍区分）。
+	EmptyStringAsNull bool
 }
 
 func (o *Options) fill() {
@@ -47,6 +54,20 @@ func (o *Options) fill() {
 	}
 	if o.MaxPKs <= 0 {
 		o.MaxPKs = 50
+	}
+}
+
+// normalizeRow 按 EmptyStringAsNull 口径把 canonical "" 折叠为 NULL 哨兵。
+// 数值/时间列的 canonical 永不为 ""，规则天然只作用于字符串/二进制空值。
+// 必须对源/目标两侧同时应用（分块 checksum 与 diffRow 才能口径一致）。
+func (o Options) normalizeRow(row []string) {
+	if !o.EmptyStringAsNull {
+		return
+	}
+	for i, v := range row {
+		if v == "" {
+			row[i] = nullSentinel
+		}
 	}
 }
 
@@ -137,6 +158,7 @@ func Compare(ctx context.Context, src, dst RowSource, opts Options) (*Report, er
 	var chunks []*chunkAcc
 	cur := &chunkAcc{}
 	err = src.Stream(ctx, func(pk string, row []string) error {
+		opts.normalizeRow(row)
 		srcMap[pk] = row
 		pkChunk[pk] = len(chunks)
 		cur.rows++
@@ -173,6 +195,7 @@ func Compare(ctx context.Context, src, dst RowSource, opts Options) (*Report, er
 		if err != nil {
 			return err
 		}
+		opts.normalizeRow(aligned)
 		if ci, ok := pkChunk[pk]; ok && ci < len(dstChunk) {
 			dstChunk[ci].rows++
 			dstChunk[ci].xorHash ^= rowHash(aligned)
@@ -211,8 +234,12 @@ func Compare(ctx context.Context, src, dst RowSource, opts Options) (*Report, er
 }
 
 // Sample 抽样比对：源端随机抽 n 个主键，两端点查逐行比较。
-// 内存 O(n)，面向超大表。
-func Sample(ctx context.Context, src, dst RowSource, n int) (*Report, error) {
+// 内存 O(n)，面向超大表。可选 Options（EmptyStringAsNull 等，K2）。
+func Sample(ctx context.Context, src, dst RowSource, n int, optsList ...Options) (*Report, error) {
+	opts := Options{}
+	if len(optsList) > 0 {
+		opts = optsList[0]
+	}
 	if n <= 0 {
 		n = 100
 	}
@@ -252,6 +279,8 @@ func Sample(ctx context.Context, src, dst RowSource, n int) (*Report, error) {
 			if err != nil {
 				return nil, err
 			}
+			opts.normalizeRow(srow)
+			opts.normalizeRow(aligned)
 			if diffs := diffRow(src.Columns(), srow, aligned); len(diffs) > 0 {
 				rep.RowDiffCount++
 				if len(rep.RowDiffs) < 50 {

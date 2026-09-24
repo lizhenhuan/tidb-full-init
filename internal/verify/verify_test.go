@@ -125,6 +125,60 @@ func TestCompareCompositePK(t *testing.T) {
 	}
 }
 
+// K2：Oracle 空串即 NULL——EmptyStringAsNull 开启时源端 '' 与目标端 NULL
+// 判等（wform 2000 行 F_Description='' 假 DIFF 回归）；关闭时镜像比对
+// 仍严格区分（'' ≠ NULL）。
+func TestCompareEmptyStringAsNull(t *testing.T) {
+	cols := []Column{{Name: "id", Kind: KindInt}, {Name: "memo", Kind: KindString}}
+	src := NewSliceSource(cols, []string{"id"}, [][]string{
+		{"1", ""}, // TiDB ''
+		{"2", nullSentinel},
+	})
+	dst := NewSliceSource(cols, []string{"id"}, [][]string{
+		{"1", nullSentinel}, // Oracle：'' 落库即 NULL
+		{"2", nullSentinel},
+	})
+
+	// 默认（TiDB↔TiDB 镜像口径）：'' ≠ NULL → 1 行 DIFF
+	rep, err := Compare(context.Background(), src, dst, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowDiffCount != 1 {
+		t.Fatalf("default mode RowDiffCount = %d, want 1 ('' must differ from NULL)", rep.RowDiffCount)
+	}
+
+	// EmptyStringAsNull（TiDB↔Oracle 口径）：'' ≡ NULL → equal
+	rep, err = Compare(context.Background(), src, dst, Options{EmptyStringAsNull: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Equal() {
+		t.Fatalf("EmptyStringAsNull compare not equal: %+v", rep)
+	}
+
+	// 非空值不受影响：'' vs "x" 仍必须 DIFF
+	dst2 := NewSliceSource(cols, []string{"id"}, [][]string{{"1", "x"}, {"2", nullSentinel}})
+	rep, err = Compare(context.Background(), src, dst2, Options{EmptyStringAsNull: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowDiffCount != 1 {
+		t.Fatalf("'' vs non-empty must still differ, RowDiffCount = %d", rep.RowDiffCount)
+	}
+
+	// Sample 路径同口径
+	srcS := NewSliceSource(cols, []string{"id"}, [][]string{{"1", ""}})
+	dstS := NewSliceSource(cols, []string{"id"}, [][]string{{"1", nullSentinel}})
+	repS, err := Sample(context.Background(), srcS, dstS, 1, Options{EmptyStringAsNull: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repS.Equal() {
+		t.Fatalf("sample EmptyStringAsNull not equal: %+v", repS)
+	}
+}
+
 func TestCompareIncompatibleSchema(t *testing.T) {
 	src := NewSliceSource(testCols(), []string{"id"}, rows1())
 	otherCols := []Column{{Name: "id", Kind: KindInt}, {Name: "amount", Kind: KindDecimal}}

@@ -366,9 +366,9 @@ func verifyTable(ctx context.Context, bc *batchCfg, dsn *mysql.Config, te tableE
 	defer dst.Close()
 
 	if bc.Sample > 0 {
-		return verify.Sample(ctx, src, dst, bc.Sample)
+		return verify.Sample(ctx, src, dst, bc.Sample, verify.Options{EmptyStringAsNull: true})
 	}
-	return verify.Compare(ctx, src, dst, verify.Options{})
+	return verify.Compare(ctx, src, dst, verify.Options{EmptyStringAsNull: true})
 }
 
 // waitForRows 轮询 Oracle 目标表行数直到达到 want（消费完成信号）。

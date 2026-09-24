@@ -91,9 +91,9 @@ func main() {
 
 	var rep *verify.Report
 	if sampleN > 0 {
-		rep, err = verify.Sample(ctx, src, dst, sampleN)
+		rep, err = verify.Sample(ctx, src, dst, sampleN, verify.Options{EmptyStringAsNull: true})
 	} else {
-		rep, err = verify.Compare(ctx, src, dst, verify.Options{ChunkSize: chunkSize, MaxRowDiffs: maxDiffs})
+		rep, err = verify.Compare(ctx, src, dst, verify.Options{ChunkSize: chunkSize, MaxRowDiffs: maxDiffs, EmptyStringAsNull: true})
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "verify:", err)

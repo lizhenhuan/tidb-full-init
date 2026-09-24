@@ -50,9 +50,10 @@ type tiDBInfo struct {
 	pkCols  []string
 	autoInc map[string]bool // auto_increment 列名集合
 
-	// J2：非自增单列整数主键的顺序分配器（max(pk)+N）。随机值在已有
-	// 多行的表上撞唯一键（part_hash 实测 5 次随机重试仍冲突），顺序
-	// 分配对既有值与本轮内自身都保证不冲突。
+	// J2/K1：主键首列（整数、非自增，单列或复合皆可）的顺序分配器
+	// （max(pk)+N）。随机值在已有多行的表上撞唯一键（part_hash 单列、
+	// part_range 复合均实测）；首列超过全表 MAX 即保证组合键唯一，
+	// 顺序分配对既有值与本轮内自身都不冲突。
 	seqPK       string // 启用顺序分配的主键列名（空 = 不启用）
 	seqUnsigned bool
 	seqMax      uint64 // 分配上限（类型值域）
@@ -133,12 +134,15 @@ func Run(ctx context.Context, cfg Config) (*Stats, error) {
 	if len(tdb.pkCols) == 0 {
 		return nil, fmt.Errorf("dmlgen: %s.%s has no primary key (canal-json 需要 pk 定位行)", schema, cfg.Table)
 	}
-	// J2：非自增单列整数主键启用 max(pk)+N 顺序分配（随机生成在已有
-	// 多行的表上撞唯一键）。字符串/复合/非整数主键维持随机（碰撞概率
-	// 可忽略，dup-entry 重试兜底）。
-	if len(tdb.pkCols) == 1 && !autoInc[tdb.pkCols[0]] {
+	// J2/K1：主键顺序分配。只要**首个 PK 列**是整数且非自增（单列或复合
+	// 皆可），就对它 max+N 顺序分配——分配值超过该列全表 MAX 后，任何
+	// 既有行都不含这个首列值，组合键必然唯一（复合键唯一性由首列独立
+	// 保证，其余 PK 列随机即可）。随机生成在已有多行的表上撞唯一键
+	// （part_hash 单列、part_range 复合均实测）。首列非整数（字符串等）
+	// 或自增的复合主键维持随机（碰撞概率可忽略，dup-entry 重试兜底）。
+	if firstPK := tdb.pkCols[0]; !autoInc[firstPK] {
 		for _, c := range info.Columns {
-			if c.Name == tdb.pkCols[0] && isIntegerCol(c.MySQLType) {
+			if c.Name == firstPK && isIntegerCol(c.MySQLType) {
 				tdb.seqPK = c.Name
 				tdb.seqUnsigned = strings.Contains(strings.ToLower(c.MySQLType), "unsigned")
 				tdb.seqMax = uint64(intMaxOf(baseTypeOf(c.MySQLType), tdb.seqUnsigned))
