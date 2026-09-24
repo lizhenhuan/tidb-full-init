@@ -59,6 +59,11 @@ type tiDBInfo struct {
 	seqMax      uint64 // 分配上限（类型值域）
 	seqNext     uint64 // 下一个待分配值
 	seqInit     bool   // 是否已从 MAX(pk) 初始化
+
+	// #t15：唯一约束成员列集合（不含 PRIMARY）。UPDATE 变异避开这些
+	// 列——随机新值撞既有行即 1062（store.idx_unique_manager 现场）；
+	// 复合唯一键任一成员都算：只改一半仍可能组合撞键。
+	uniqCols map[string]bool
 }
 
 // nextSeqPK 分配下一个主键值。首次调用查询 MAX(pk) 初始化基线，
@@ -125,7 +130,11 @@ func Run(ctx context.Context, cfg Config) (*Stats, error) {
 	if info, autoInc, err = fetchTableInfo(ctx, db, schema, cfg.Table); err != nil {
 		return nil, err
 	}
-	tdb := &tiDBInfo{db: db, schema: schema, table: cfg.Table, autoInc: autoInc}
+	uniqCols, err := fetchUniqueCols(ctx, db, schema, cfg.Table)
+	if err != nil {
+		return nil, err
+	}
+	tdb := &tiDBInfo{db: db, schema: schema, table: cfg.Table, autoInc: autoInc, uniqCols: uniqCols}
 	for _, c := range info.Columns {
 		if c.IsPrimaryKey {
 			tdb.pkCols = append(tdb.pkCols, c.Name)
@@ -154,7 +163,7 @@ func Run(ctx context.Context, cfg Config) (*Stats, error) {
 	w := kafka.NewWriter(kafka.WriterConfig{
 		Brokers: cfg.Brokers, Topic: cfg.Topic,
 		Balancer: kafka.CRC32Balancer{}, // Kafka 标准按 Key 哈希：同 PK 同分区（D3）
-		Async:   false,
+		Async:    false,
 	})
 	defer w.Close()
 
@@ -279,6 +288,58 @@ func fetchTableInfo(ctx context.Context, db *sql.DB, schema, table string) (*enc
 	return info, autoInc, nil
 }
 
+// fetchUniqueCols 唯一约束成员列集合（#t15）：information_schema.statistics
+// 中 non_unique=0 且非 PRIMARY 的索引列。UNIQUE KEY 与 UNIQUE 索引同源；
+// 复合唯一键的每个成员列都计入。
+func fetchUniqueCols(ctx context.Context, db *sql.DB, schema, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT column_name
+		FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ?
+		  AND non_unique = 0 AND index_name <> 'PRIMARY'`, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("dmlgen: query unique indexes: %w", err)
+	}
+	defer rows.Close()
+	uniq := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("dmlgen: scan unique index column: %w", err)
+		}
+		uniq[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("dmlgen: iterate unique indexes: %w", err)
+	}
+	return uniq, nil
+}
+
+// pickUpdateTarget 选 UPDATE 变更列（#t15）：非 PK 且非 UNIQUE 成员优先
+// （UNIQUE 列随机新值撞既有行即 1062）；无普通列退非 PK 任意列（残余
+// 碰撞由 1062 重试兜底）；全 PK/UNIQUE 表退首 PK 列（改回同值也算
+// UPDATE 事件）。nil = 无列可改。
+func pickUpdateTarget(info *encoder.TableInfo, t *tiDBInfo) *encoder.ColumnInfo {
+	for i := range info.Columns {
+		c := &info.Columns[i]
+		if !c.IsPrimaryKey && !t.uniqCols[c.Name] {
+			return c
+		}
+	}
+	for i := range info.Columns {
+		c := &info.Columns[i]
+		if !c.IsPrimaryKey {
+			return c
+		}
+	}
+	for i := range info.Columns {
+		if info.Columns[i].Name == t.pkCols[0] {
+			return &info.Columns[i]
+		}
+	}
+	return nil
+}
+
 // dmlMsg 一条 DML 对应的 Kafka 消息 + 分区键。
 type dmlMsg struct {
 	msg *encoder.CanalMessage
@@ -335,42 +396,41 @@ func doInsert(ctx context.Context, t *tiDBInfo, info *encoder.TableInfo, rng *ra
 	}
 }
 
-// doUpdate 抽一行 → 选一个非 PK 列改值 → UPDATE → 编码消息。
-// 表空返回 (nil, nil)。
+// doUpdate 抽一行 → 选列改值（非 PK 非 UNIQUE 优先，#t15）→ UPDATE
+// （1062 换值重试兜底）→ 编码消息。表空返回 (nil, nil)。
 func doUpdate(ctx context.Context, t *tiDBInfo, info *encoder.TableInfo, rng *rand.Rand) (*dmlMsg, error) {
 	row, pkVals, err := sampleRow(ctx, t, info, rng)
 	if err != nil || row == nil {
 		return nil, err
 	}
-	// 选变更列：非 PK 优先；全 PK 表跳过（无列可改）
-	var target *encoder.ColumnInfo
-	for i := range info.Columns {
-		if info.Columns[i].IsPrimaryKey {
-			continue
-		}
-		target = &info.Columns[i]
-		break
-	}
+	target := pickUpdateTarget(info, t)
 	if target == nil {
-		// 无非 PK 列可改：改回同值也算 UPDATE 事件（Old=After 同值）
-		for i := range info.Columns {
-			if info.Columns[i].Name == t.pkCols[0] {
-				target = &info.Columns[i]
-				break
-			}
-		}
-		if target == nil {
-			return nil, nil
-		}
+		return nil, nil
 	}
 
+	// #t15：选列已避开 UNIQUE 成员（首选普通列），但全 UNIQUE 表只能
+	// 硬碰——变异后撞 1062 时换值重试（与 doInsert 的 dup 重试同构）。
 	oldVal := row[target.Name]
-	newVal := mutateValue(*target, oldVal, rng)
-	_, err = t.db.ExecContext(ctx,
-		fmt.Sprintf("UPDATE %s.%s SET %s = ? WHERE %s",
-			quoteIdent(t.schema), quoteIdent(t.table), quoteIdent(target.Name), wherePK(t)),
-		append([]interface{}{newVal}, pkArgs(t, pkVals)...)...)
-	if err != nil {
+	var newVal interface{}
+	backoff := 100 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		newVal = mutateValue(*target, oldVal, rng)
+		_, err = t.db.ExecContext(ctx,
+			fmt.Sprintf("UPDATE %s.%s SET %s = ? WHERE %s",
+				quoteIdent(t.schema), quoteIdent(t.table), quoteIdent(target.Name), wherePK(t)),
+			append([]interface{}{newVal}, pkArgs(t, pkVals)...)...)
+		if err == nil {
+			break
+		}
+		if isDupEntry(err) && attempt < 5 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			continue
+		}
 		return nil, fmt.Errorf("dmlgen: update %s.%s: %w", t.schema, t.table, err)
 	}
 
