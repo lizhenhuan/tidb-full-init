@@ -115,8 +115,10 @@ func (r *Reader) scanPartition(
 			break
 		}
 
-		// D13 启动校验：首批数据先验证列 ID 与 schema 一致，防止 DROP COLUMN
-		// 后 ORDINAL_POSITION 与真实列 ID 错位导致静默丢列。
+		// D13 启动校验：首批含 record 的数据先验证列 ID 与 schema 一致，
+		// 防止 DROP COLUMN 后 ORDINAL_POSITION 与真实列 ID 错位导致静默丢列。
+		// 首批可能全是非 record key（索引等）：遇到首个非空 sample 才置位，
+		// 否则会跳过校验（复审 P2#4）。
 		if !validated {
 			sample := make([][]byte, 0, len(pairs))
 			for _, pair := range pairs {
@@ -124,11 +126,13 @@ func (r *Reader) scanPartition(
 					sample = append(sample, pair.Value)
 				}
 			}
-			if err := ValidateColumnIDs(sample, tableInfo.Columns); err != nil {
-				errCh <- fmt.Errorf("partition %d: %w", partition, err)
-				return
+			if len(sample) > 0 {
+				if err := ValidateColumnIDs(sample, tableInfo.Columns); err != nil {
+					errCh <- fmt.Errorf("partition %d: %w", partition, err)
+					return
+				}
+				validated = true
 			}
-			validated = true
 		}
 
 		for _, pair := range pairs {

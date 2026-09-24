@@ -199,15 +199,23 @@ func (d *Dialect) validateIdentifier(kind, name string) error {
 }
 
 // ValidateTable 任务创建前的表级校验（设计文档 D4）。
+// 校验目标端 schema（Schema()：TargetSchema 优先），而非源库文名——
+// 目标 OWNER 才是真正落库的标识符（复审 P2#5）。
 func (d *Dialect) ValidateTable(meta model.TableMeta) error {
-	if err := d.validateIdentifier("database", meta.Database); err != nil {
+	if err := d.validateIdentifier("schema", meta.Schema()); err != nil {
 		return err
 	}
 	if err := d.validateIdentifier("table", meta.Table); err != nil {
 		return err
 	}
 	if len(meta.PKNames) == 0 {
-		return fmt.Errorf("oracle: table %s.%s has no primary key (一期硬约束)", meta.Database, meta.Table)
+		return fmt.Errorf("oracle: table %s.%s has no primary key (一期硬约束)", meta.Schema(), meta.Table)
+	}
+	// P1#8：仅主键列的表无法生成合法的 UPDATE SET，任务创建/DDL 预览阶段
+	// 就要挡住，不能等首次写入才炸（复审意见：从 RenderUpsert 前移）。
+	if len(meta.Columns) == len(meta.PKNames) {
+		return fmt.Errorf("oracle: table %s.%s contains only PK columns; "+
+			"MERGE upsert requires at least one non-PK column", meta.Schema(), meta.Table)
 	}
 	for _, col := range meta.Columns {
 		if err := d.validateIdentifier("column", col.Name); err != nil {
@@ -276,11 +284,6 @@ func (d *Dialect) RenderUpsert(meta model.TableMeta) (string, error) {
 		return "", err
 	}
 	target := d.qualified(meta)
-	// P1#8：仅主键列的表无法生成合法的 UPDATE SET，一期明确拒绝。
-	if len(meta.Columns) == len(meta.PKNames) {
-		return "", fmt.Errorf("oracle: table %s.%s contains only PK columns; "+
-			"MERGE upsert requires at least one non-PK column", meta.Schema(), meta.Table)
-	}
 	var src, on, set, cols, vals strings.Builder
 	for i, col := range meta.Columns {
 		c := d.QuoteIdentifier(col.Name)

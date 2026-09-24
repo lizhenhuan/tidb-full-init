@@ -148,23 +148,53 @@ func (s *Sink) WriteBatch(ctx context.Context, meta model.TableMeta, events []mo
 		return nil
 	}
 
+	// reprepare 在数据错误后重建语句：真库实测 go-ora 的 prepared
+	// statement 在一次 exec 报 ORA-01722 后，同语句下一次 exec 会抛
+	// ORA-03120（语句状态被污染），必须重建才能继续本批剩余行。
+	reprepare := func(stmt **sql.Stmt, query string) error {
+		if *stmt != nil {
+			(*stmt).Close()
+		}
+		ns, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		*stmt = ns
+		return nil
+	}
+
 	for i := range events {
 		if err := applyOne(&events[i]); err != nil {
 			var we *WriteError
 			if errors.As(err, &we) && !we.Retryable {
-				// 数据错误 → 记 RowFailure 跳过该行，其余行照常提交（DLQ）
+				// 数据错误 → 记 RowFailure 跳过该行，其余行照常提交（DLQ）。
+				// 执行失败的语句状态不可信，重建后继续。
 				res.Failed = append(res.Failed, sink.RowFailure{
 					Topic: events[i].Topic, Partition: events[i].Partition,
 					Offset: events[i].Offset, Table: meta.Table,
 					Reason: err.Error(), Retryable: false,
 				})
+				if rerr := reprepare(&upsertStmt, upsertSQL); rerr != nil {
+					res.Applied, res.Failed = 0, nil
+					return res, fmt.Errorf("oraclesink reprepare upsert: %w", rerr)
+				}
+				if rerr := reprepare(&deleteStmt, deleteSQL); rerr != nil {
+					res.Applied, res.Failed = 0, nil
+					return res, fmt.Errorf("oraclesink reprepare delete: %w", rerr)
+				}
 				continue
 			}
-			return res, err // 可重试 → 整批回滚，交给 applier 重放
+			// 可重试 → 整批回滚（defer Rollback），交给 applier 重放整批：
+			// 已累计的 Applied/Failed 全部随事务作废，重放时重新推导，
+			// 不能返回"已回滚但 Applied>0"的矛盾状态（复审 P1#3）。
+			res.Applied = 0
+			res.Failed = nil
+			return res, err
 		}
 		res.Applied++
 	}
 	if err := tx.Commit(); err != nil {
+		res.Applied, res.Failed = 0, nil // 提交失败同样整体作废
 		return res, classify(err)
 	}
 	return res, nil
