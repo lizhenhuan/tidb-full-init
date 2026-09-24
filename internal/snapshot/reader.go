@@ -150,20 +150,18 @@ func (r *Reader) scanPartition(
 				continue
 			}
 
-			handle := extractHandleFromKey(pair.Key)
 			rowData, err := decodeRowValue(pair.Value, tableInfo)
 			if err != nil {
 				log.Printf("[part-%d] decode error at key=%x: %v", partition, pair.Key, err)
 				continue
 			}
 
-			// Set primary key value from handle (stored in key, not in value)
-			if handle > 0 {
-				for _, pk := range tableInfo.PKNames {
-					if _, exists := rowData[pk]; !exists {
-						rowData[pk] = fmt.Sprintf("%d", handle)
-					}
-				}
+			// 聚簇表主键列只存于行键（H1）：从 key 回填缺失主键列，
+			// 支持 int / varchar / 复合主键。失败必须中止扫描——快照阶段
+			// 没有 DLQ 旁路，静默跳行等于悄悄丢整行数据。
+			if err := fillPKFromKey(pair.Key, tableInfo, rowData); err != nil {
+				errCh <- fmt.Errorf("partition %d: %w", partition, err)
+				return
 			}
 
 			msg := encoder.NewInsertMessage(tableInfo)
@@ -308,15 +306,6 @@ func isRecordKey(k []byte) bool {
 		return false
 	}
 	return k[0] == 't' && k[9] == '_' && k[10] == 'r'
-}
-
-// extractHandleFromKey extracts the int64 handle (row ID) from a TiDB record key.
-// Key format: 't' + EncodeInt(tableID) + "_r" + EncodeInt(handle)
-func extractHandleFromKey(k []byte) int64 {
-	if len(k) < 19 { // 1 + 8 + 2 + 8
-		return 0
-	}
-	return tikv.DecodeInt(k[11:19])
 }
 
 func decodeRowValue(value []byte, tableInfo *encoder.TableInfo) (map[string]string, error) {

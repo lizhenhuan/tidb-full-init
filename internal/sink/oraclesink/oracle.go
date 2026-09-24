@@ -345,6 +345,10 @@ var rowDataORACodes = map[int]bool{
 	1861:  true, // 日期字面量与格式串不匹配
 	1840:  true, // 输入值不够长
 	12899: true, // 值超出列宽
+	// H2（#t6 复审）：值超出列精度。典型源是 dialect 有损精度映射
+	// （DECIMAL(65,30)→NUMBER(38,30)，整数位预算 35→8 位）——单行数据
+	// 超预算时跳行 + DLQ + 前进 offset，损失可见且不中止其余表。
+	1438: true,
 }
 
 // dataError 把本地绑定/转换失败包装为行级数据错误（→ DLQ）。

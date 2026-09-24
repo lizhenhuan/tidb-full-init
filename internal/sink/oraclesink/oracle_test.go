@@ -183,6 +183,7 @@ func TestClassify(t *testing.T) {
 		errors.New("ORA-01400: cannot insert NULL into mandatory column"),
 		errors.New("ORA-01861: literal does not match format string"),
 		errors.New("ORA-12899: value too large for column"),
+		errors.New("ORA-01438: value larger than specified precision allows"), // H2：精度映射溢出→DLQ 不中止
 	}
 	for _, err := range dataErrors {
 		got := classify(err)

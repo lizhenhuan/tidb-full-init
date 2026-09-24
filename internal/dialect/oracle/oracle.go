@@ -134,6 +134,12 @@ func (d *Dialect) MapType(table, column, mysqlType string) (string, error) {
 			return "NUMBER", nil
 		}
 		if pt.Prec > 38 {
+			// 有损映射边界（#t6 复审 H2）：Oracle NUMBER 上限 38 位十进制，
+			// 精度截断而 scale 原样保留——DECIMAL(65,30) 映射为 NUMBER(38,30)，
+			// 整数位预算从 35 位缩到 8 位。超预算值写入报 ORA-01438，
+			// oraclesink 将其归为行级数据错误（跳行 + DLQ + 前进 offset）：
+			// 单行损失在 kafka_dlq 可见、不中止管道。需要无损承载时应收紧
+			// 源列精度，勿依赖此截断。
 			pt.Prec = 38 // 超精度截断告警由 ValidateTable 补充
 		}
 		if pt.Scale > 0 {
