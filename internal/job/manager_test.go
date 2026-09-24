@@ -2,6 +2,7 @@
 package job
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/ddlsync"
@@ -40,11 +41,15 @@ func TestQualifiedTableKey(t *testing.T) {
 }
 
 // TestResultRowQualified 拼装钉子（P3-1：resultRow 必须产出全限定 table，
-// 回退成短名则此处红）。
+// 回退成短名则此处红；同时钉 overwrite DROP 重建 warning 透传，P2-1 标注）。
 func TestResultRowQualified(t *testing.T) {
-	row := resultRow("smoke_b", ddlsync.TableResult{Table: "dup_t", Status: "success"})
+	row := resultRow("smoke_b", ddlsync.TableResult{Table: "dup_t", Status: "success",
+		Warnings: []string{"已按 overwrite DROP 重建：目标原表（含数据）已被丢弃，本行为不可恢复"}})
 	if row.Table != "smoke_b.dup_t" {
 		t.Fatalf("qualified assembly regressed: %q", row.Table)
+	}
+	if len(row.Warnings) != 1 || !strings.Contains(row.Warnings[0], "overwrite") {
+		t.Fatalf("overwrite drop warning must pass through: %+v", row.Warnings)
 	}
 }
 

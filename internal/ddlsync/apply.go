@@ -30,6 +30,7 @@ type TableResult struct {
 	ErrorCode   string // ORA-\d+（执行失败时）
 	ErrorText   string
 	Compat      []CompatItem
+	Warnings    []string // 如 overwrite DROP 重建（目标数据已丢弃）显式标注
 }
 
 // RunConfig 一次同步任务的输入。
@@ -150,17 +151,22 @@ func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dia
 	}
 	r.DDL = joinStatements(stmts)
 
-	// 已存在且非 overwrite → skipped（skipped 两态之二）
-	if !cfg.Overwrite {
-		var n int
-		q := `SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = :o AND TABLE_NAME = :t`
-		if err := oraDB.QueryRowContext(ctx, q,
-			sql.Named("o", target), sql.Named("t", table)).Scan(&n); err == nil && n > 0 {
+	// 目标存在性检查（只读，dry-run 同样执行）：
+	// 已存在且非 overwrite → skipped（skipped 两态之二）；已存在且
+	// overwrite → DROP 重建高危标注（设计 §2：报告对被 DROP 表显式标注）。
+	var n int
+	q := `SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER = :o AND TABLE_NAME = :t`
+	exists := oraDB.QueryRowContext(ctx, q,
+		sql.Named("o", target), sql.Named("t", table)).Scan(&n) == nil && n > 0
+	if exists {
+		if !cfg.Overwrite {
 			r.Status = StatusSkipped
 			r.ErrorCode = "ORA-00955"
 			r.ErrorText = "table already exists in target (overwrite=false)"
 			return r
 		}
+		r.Warnings = append(r.Warnings,
+			"已按 overwrite DROP 重建：目标原表（含数据）已被丢弃，本行为不可恢复")
 	}
 
 	if cfg.DryRun {

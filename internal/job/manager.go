@@ -225,6 +225,7 @@ func toRow(t ddlsync.TableResult) DDLResultRow {
 	row := DDLResultRow{
 		Table: t.Table, TargetTable: t.TargetTable, Status: t.Status,
 		DDL: t.DDL, ErrorCode: t.ErrorCode, ErrorText: t.ErrorText,
+		Warnings: t.Warnings,
 	}
 	for _, c := range t.Compat {
 		row.Compat = append(row.Compat, CompatIssue{
