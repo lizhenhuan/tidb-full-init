@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,18 @@ import (
 	"github.com/lizhenhuan/tidb-full-init/internal/sink"
 	"github.com/lizhenhuan/tidb-full-init/internal/sink/mocksink"
 )
+
+// faultGate 与 L2 E2E 同一约定：未显式设 E2E_KAFKA=1 时跳过
+// （CI/无 Docker 环境默认路径必须全绿，M2 收口复审 P1）。
+func faultGate(t *testing.T) {
+	t.Helper()
+	if os.Getenv("E2E_KAFKA") != "1" {
+		t.Skip("E2E_KAFKA != 1; skipping L3 fault E2E (needs Docker)")
+	}
+	if testing.Short() {
+		t.Skip("short mode")
+	}
+}
 
 // startFaultBroker 起独立 redpanda + 双分区 topic（每个用例隔离）。
 func startFaultBroker(t *testing.T) (context.Context, *redpanda.Container, string) {
@@ -111,9 +124,7 @@ var faultTP0 = model.TopicPartition{Topic: e2eTopic, Partition: 0}
 // 场景 1：目标端已 commit、SQLite 未 Save → 管道中止（位点未前进）→
 // 重启后整窗重放，终态幂等（行数不变 = 不丢不重）。
 func TestE2EFaultCommitBeforeCheckpoint(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	faultGate(t)
 	ctx, _, broker := startFaultBroker(t)
 	faultProduce(t, ctx, broker, 0, "1", "2")
 
@@ -166,12 +177,28 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
-// 场景 2：broker 短暂不可达（容器 Stop/Start）→ 管道退出或停滞但位点停在
-// last-applied；恢复后续传，全部消息到达、无跳过、无重复。
-func TestE2EFaultBrokerRestart(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
+// brokerReady 轮询 broker 恢复可达（容器 Start 返回不等于监听就绪）。
+func brokerReady(t *testing.T, ctx context.Context, broker string) {
+	t.Helper()
+	cl := &kafka.Client{Addr: kafka.TCP(broker), Timeout: 3 * time.Second}
+	for i := 0; i < 60; i++ {
+		if _, err := cl.Metadata(ctx, &kafka.MetadataRequest{}); err == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("ctx done while waiting for broker")
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
+	t.Fatal("broker not reachable within 30s after restart")
+}
+
+// 场景 2：broker 短暂不可达（容器 Stop/Start）→ 管道 fail-loud 退出
+// （分区泵连接错误上抛，收口复审 P1）但位点停在 last-applied；
+// 恢复后重启管道续传，全部消息到达、无跳过、无重复。
+func TestE2EFaultBrokerRestart(t *testing.T) {
+	faultGate(t)
 	ctx, rp, broker := startFaultBroker(t)
 	ids := make([]string, 120)
 	for i := range ids {
@@ -200,22 +227,37 @@ func TestE2EFaultBrokerRestart(t *testing.T) {
 		t.Fatalf("start broker: %v", err)
 	}
 
-	// 若管道在断连期间已退出（fetch fatal），重启管道续传；否则原地等完成
-	select {
-	case err := <-done:
-		t.Logf("pipeline exited during outage (acceptable): %v", err)
-		cancel2, done2 := runPipelineStore(ctx, t, broker, store, ms, nil, faultCfg)
-		_ = cancel2
-		done = done2
-	default:
-	}
-	runUntil(t, 60*time.Second, func() bool {
+	// 断连期间管道 fail-loud 退出（预期路径）或原地存活；退出则等 broker
+	// 就绪后重启续传。重启若再撞上未就绪窗口退出，继续重试。
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Logf("pipeline exited during outage (fail-loud, acceptable): %v", err)
+			brokerReady(t, ctx, broker)
+			cancel, done = runPipelineStore(ctx, t, broker, store, ms, nil, faultCfg)
+		default:
+		}
 		off, _ := store.Load(ctx, faultTP0)
-		return off == 119
-	}, "all 120 messages checkpointed after broker recovery")
+		if off == 119 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("checkpoint did not reach 119 within 90s (last=%d)", off)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	cancel()
 	if err := waitPipeline(t, done); err != nil {
-		t.Fatalf("final Run: %v", err)
+		// 两类可容忍的收尾错误（数据完整性由下方 rows + 循环内 off==119 把关）：
+		// ① 断连期间死掉的分区泵，其错误在消费完剩余消息后才被 Fetch 取到——
+		//    fail-loud 上报本身正确（专门用例 TestE2EFaultPumpDeathFailsLoud）；
+		// ② 原管道实际已完成全部工作，替换管道被我们 cancel 在启动途中。
+		if contains(err.Error(), "partition pump") || contains(err.Error(), "context canceled") {
+			t.Logf("final Run exited with %v (tolerable post-recovery path)", err)
+		} else {
+			t.Fatalf("final Run: %v", err)
+		}
 	}
 	if got := ms.Rows("d", "t1"); got != 120 {
 		t.Fatalf("rows = %d, want 120 (no skip, no dup across broker restart)", got)
@@ -224,9 +266,7 @@ func TestE2EFaultBrokerRestart(t *testing.T) {
 
 // 场景 3：同一批 offset 重复投递（清空位点全量重放）→ 终态幂等。
 func TestE2EFaultDuplicateDelivery(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	faultGate(t)
 	ctx, _, broker := startFaultBroker(t)
 	faultProduce(t, ctx, broker, 0, "1", "2", "3")
 
@@ -265,5 +305,51 @@ func TestE2EFaultDuplicateDelivery(t *testing.T) {
 	}
 	if got := ms.Rows("d", "t1"); got != 3 {
 		t.Fatalf("rows after duplicate delivery = %d, want 3 (idempotent terminal state)", got)
+	}
+}
+
+// 场景 4（收口复审 P1）：单分区泵致命错误必须 fail loud——
+// 预置恢复位点 4（下一条 = 5）但分区 LEO=0（retention 截断越过
+// SQLite last-applied 的丢数据场景）→ 泵收到 OffsetOutOfRange，
+// Run 必须报错退出，不得静默空转、不得前进位点。
+func TestE2EFaultPumpDeathFailsLoud(t *testing.T) {
+	faultGate(t)
+	ctx, _, broker := startFaultBroker(t) // topic 为空，LEO=0
+
+	store, err := checkpoint.NewSQLiteStore(ctx, filepath.Join(t.TempDir(), "cp.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Save(ctx, faultTP0, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	ms := mocksink.New()
+	cancel, done := runPipelineStore(ctx, t, broker, store, ms, nil, faultCfg)
+	defer cancel()
+	runErr := waitPipeline(t, done)
+	if runErr == nil || !contains(runErr.Error(), "partition pump") {
+		t.Fatalf("Run must fail loud on partition pump death, got %v", runErr)
+	}
+	if got := ms.Rows("d", "t1"); got != 0 {
+		t.Fatalf("rows = %d, want 0", got)
+	}
+	if off, _ := store.Load(ctx, faultTP0); off != 4 {
+		t.Fatalf("checkpoint = %d, want 4 (unchanged)", off)
+	}
+}
+
+// 二次 Assign 拒绝（收口复审 P2：旧 readers 泄漏 + cancel 覆盖）。
+// NewReader/SetOffset 不触网，无需 Docker，不走 E2E 门控。
+func TestAssignTwiceRejected(t *testing.T) {
+	c := consumer.NewKafkaConsumer(consumer.KafkaConfig{Brokers: []string{"127.0.0.1:19092"}})
+	defer c.Close()
+	tps := []model.TopicPartition{{Topic: "t", Partition: 0}}
+	if err := c.Assign(context.Background(), tps); err != nil {
+		t.Fatalf("first Assign: %v", err)
+	}
+	if err := c.Assign(context.Background(), tps); err == nil || !contains(err.Error(), "already assigned") {
+		t.Fatalf("second Assign must be rejected, got %v", err)
 	}
 }

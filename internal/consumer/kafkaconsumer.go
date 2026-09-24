@@ -32,6 +32,7 @@ type KafkaConsumer struct {
 	mu           sync.Mutex
 	readers      []*kafka.Reader
 	msgs         chan kafka.Message
+	errs         chan error // 分区泵 goroutine 的致命错误（fail loud，M2 收口复审 P1）
 	wg           sync.WaitGroup
 	cancel       context.CancelFunc
 	closed       bool
@@ -66,17 +67,22 @@ func (c *KafkaConsumer) SetStartOffsets(next map[model.TopicPartition]int64) {
 }
 
 // Assign 手动分配分区（Consumer 接口）。每个分区一个 reader，
-// 起始位点取 SetStartOffsets 的值（默认 0）。
+// 起始位点取 SetStartOffsets 的值（默认 0）。二次 Assign 会被拒绝
+// （旧 readers 会泄漏、cancel 会被覆盖，M2 收口复审 P2）。
 func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPartition) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return fmt.Errorf("kafkaconsumer: already closed")
 	}
+	if len(c.readers) > 0 {
+		return fmt.Errorf("kafkaconsumer: partitions already assigned; create a new consumer instead")
+	}
 	if len(partitions) == 0 {
 		return fmt.Errorf("kafkaconsumer: no partitions to assign")
 	}
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.errs = make(chan error, len(partitions))
 	for _, tp := range partitions {
 		r := kafka.NewReader(kafka.ReaderConfig{
 			Brokers:   c.cfg.Brokers,
@@ -84,6 +90,9 @@ func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPart
 			Partition: tp.Partition,
 			MinBytes:  c.cfg.MinBytes,
 			MaxBytes:  c.cfg.MaxBytes,
+			// 位点越界（Kafka retention 截断越过 SQLite last-applied =
+			// 数据丢失场景）不静默重试等待，直接报错上抛（fail loud）。
+			OffsetOutOfRangeError: true,
 		})
 		off := c.startOffsets[tp]
 		if err := r.SetOffset(off); err != nil {
@@ -98,7 +107,20 @@ func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPart
 			for {
 				m, err := rd.FetchMessage(runCtx)
 				if err != nil {
-					return // ctx 取消或 reader 关闭
+					// Close 先 cancel 再关 reader，此时 runCtx 已取消，
+					// 关停引发的错误不外抛
+					if runCtx.Err() != nil {
+						return
+					}
+					// 致命泵错误（OffsetOutOfRange/认证/未知分区等）：
+					// 上抛给 Fetch → Run fail loud。绝不能静默退出——
+					// 否则单分区泵死、管道空转零上报（M2 收口复审 P1）
+					cfg := rd.Config()
+					select {
+					case c.errs <- fmt.Errorf("kafkaconsumer: partition pump %s/%d died: %w", cfg.Topic, cfg.Partition, err):
+					default:
+					}
+					return
 				}
 				select {
 				case c.msgs <- m:
@@ -113,11 +135,14 @@ func (c *KafkaConsumer) Assign(ctx context.Context, partitions []model.TopicPart
 }
 
 // Fetch 拉取下一条消息（任意已分配分区）；ctx 取消时返回 ctx.Err()。
+// 分区泵 goroutine 的致命错误也在这里上抛（fail loud）。
 // 分区内顺序由单 Reader 保证；跨分区无序（D3：按分区并行）。
 func (c *KafkaConsumer) Fetch(ctx context.Context) (Message, error) {
 	select {
 	case <-ctx.Done():
 		return Message{}, ctx.Err()
+	case err := <-c.errs:
+		return Message{}, err
 	case m, ok := <-c.msgs:
 		if !ok {
 			return Message{}, fmt.Errorf("kafkaconsumer: closed")
