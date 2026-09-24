@@ -54,9 +54,9 @@ func TestConvertGolden(t *testing.T) {
 			"  \"updated_at\" TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,\n" +
 			"  \"note\" CLOB\n" +
 			"  ,CONSTRAINT \"PK_orders\" PRIMARY KEY (\"id\")\n" +
-			"  ,CONSTRAINT \"UK_uk_order\" UNIQUE (\"order_no\")\n" +
+			"  ,CONSTRAINT \"UK_orders_uk_order\" UNIQUE (\"order_no\")\n" +
 			")",
-		"index | CREATE INDEX \"IDX_idx_status\" ON \"shop\".\"orders\" (\"status\")",
+		"index | CREATE INDEX \"IDX_orders_idx_status\" ON \"shop\".\"orders\" (\"status\")",
 		"comment | COMMENT ON TABLE \"shop\".\"orders\" IS '订单表'",
 		"comment | COMMENT ON COLUMN \"shop\".\"orders\".\"id\" IS '主键'",
 		"comment | COMMENT ON COLUMN \"shop\".\"orders\".\"order_no\" IS '存在 '' 引号'''",
@@ -241,7 +241,7 @@ func TestConvertSkipBadColumns(t *testing.T) {
 		t.Errorf("comment on skipped column must be dropped:\n%s", joined)
 	}
 	// 其余结构保留
-	for _, keep := range []string{`"order_no" VARCHAR2(32 CHAR)`, `"PK_orders"`, `UK_uk_order`, `IDX_idx_status`} {
+	for _, keep := range []string{`"order_no" VARCHAR2(32 CHAR)`, `"PK_orders"`, `UK_orders_uk_order`, `IDX_orders_idx_status`} {
 		if !strings.Contains(joined, keep) {
 			t.Errorf("missing %s in baseline:\n%s", keep, joined)
 		}
@@ -267,6 +267,95 @@ func TestConvertExpressionIndexCompat(t *testing.T) {
 	joined := joinStatements(stmts)
 	if strings.Contains(joined, "idx_expr") {
 		t.Errorf("expression index DDL must not be generated:\n%s", joined)
+	}
+}
+
+// TestIndexConstraintNamesTableQualified P1 钉子（#t12 扫描 ORA-00955/
+// ORA-02264）：Oracle 索引名与约束名 schema 全局，MySQL 表内同名的
+// 索引/UK 跨表必撞——生成名必须纳入表名限定，两表互不相同。
+func TestIndexConstraintNamesTableQualified(t *testing.T) {
+	d := oracle.NewWithIdentLimit(128)
+	mk := func(table string) *TableMetaFull {
+		m := goldenMeta()
+		m.Table = table
+		m.Uniques = []IndexMeta{{Name: "role_id", Columns: []string{"order_no"}}}
+		m.Indexes = []IndexMeta{{Name: "status", Columns: []string{"status"}}}
+		return m
+	}
+	seen := map[string]bool{}
+	for _, tbl := range []string{"col_restrictions", "project_role_restrictions"} {
+		stmts, _, err := Convert(mk(tbl), d, ConvertOptions{TargetSchema: "shop"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := joinStatements(stmts)
+		for _, want := range []string{"IDX_" + tbl + "_status", "UK_" + tbl + "_role_id"} {
+			if !strings.Contains(joined, `"`+want+`"`) {
+				t.Errorf("%s: missing qualified name %q:\n%s", tbl, want, joined)
+			}
+			if seen[want] {
+				t.Errorf("cross-table collision on %q", want)
+			}
+			seen[want] = true
+		}
+	}
+}
+
+// TestSkipDuplicateAndLobIndex P2 钉子（ORA-01408 / ORA-02327）：列集与
+// PK/UK/已建索引完全相同的索引剔除并记 compat；LOB 列索引剔除并记 compat。
+func TestSkipDuplicateAndLobIndex(t *testing.T) {
+	m := goldenMeta()
+	m.Indexes = append(m.Indexes,
+		IndexMeta{Name: "dup_pk", Columns: []string{"id"}},         // = PK 列集
+		IndexMeta{Name: "dup_uk", Columns: []string{"order_no"}},   // = UK 列集
+		IndexMeta{Name: "st2", Columns: []string{"status"}},        // = 同表已建索引列集
+		IndexMeta{Name: "idx_note", Columns: []string{"note"}},     // CLOB 列
+	)
+	stmts, extra, err := Convert(m, oracle.NewWithIdentLimit(128), ConvertOptions{TargetSchema: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := joinStatements(stmts)
+	if n := strings.Count(joined, "CREATE INDEX"); n != 1 {
+		t.Fatalf("only the unique non-LOB index must survive, got %d:\n%s", n, joined)
+	}
+	if !strings.Contains(joined, `"IDX_orders_idx_status"`) {
+		t.Fatalf("surviving index wrong:\n%s", joined)
+	}
+	if len(extra) != 4 {
+		t.Fatalf("want 4 compat items (dup_pk/dup_uk/st2/idx_note), got %d: %+v", len(extra), extra)
+	}
+	for _, it := range extra {
+		if it.PreCheckType != PreCheckDataType || it.Level != "table" {
+			t.Errorf("compat item malformed: %+v", it)
+		}
+	}
+}
+
+// TestDateLiteralDefault P2 钉子（ORA-01847）：日期时间字面量默认在
+// TIMESTAMP/DATE 列必须走 ANSI 字面量/TO_DATE，不得裸引号赌 NLS。
+func TestDateLiteralDefault(t *testing.T) {
+	cases := []struct{ def, typ, want string }{
+		{"0001-01-01 00:00:00", "TIMESTAMP", ` DEFAULT TIMESTAMP '0001-01-01 00:00:00'`},
+		{"2024-01-02", "DATE", ` DEFAULT DATE '2024-01-02'`},
+		{"2024-01-02 03:04:05", "DATE", ` DEFAULT TO_DATE('2024-01-02 03:04:05', 'YYYY-MM-DD HH24:MI:SS')`},
+		{"2024-01-02 03:04:05.123", "TIMESTAMP", ` DEFAULT TIMESTAMP '2024-01-02 03:04:05.123'`},
+	}
+	for _, c := range cases {
+		got, err := columnMods(ColumnMeta{Nullable: true, HasDefault: true, Default: c.def}, c.typ)
+		if err != nil || got != c.want {
+			t.Errorf("%s on %s: got %q err %v, want %q", c.def, c.typ, got, err, c.want)
+		}
+	}
+	// 非日期目标列：同字面量保持普通引号字面量
+	got, err := columnMods(ColumnMeta{Nullable: true, HasDefault: true, Default: "2024-01-02"}, "VARCHAR2(32 CHAR)")
+	if err != nil || got != ` DEFAULT '2024-01-02'` {
+		t.Errorf("varchar col must keep quoted literal: %q %v", got, err)
+	}
+	// 与 NOT NULL 组合：DEFAULT（含日期字面量）仍在前
+	got, err = columnMods(ColumnMeta{Nullable: false, HasDefault: true, Default: "0001-01-01 00:00:00"}, "TIMESTAMP")
+	if err != nil || got != ` DEFAULT TIMESTAMP '0001-01-01 00:00:00' NOT NULL` {
+		t.Errorf("combined with NOT NULL: %q %v", got, err)
 	}
 }
 

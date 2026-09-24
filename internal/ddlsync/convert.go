@@ -79,6 +79,7 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 	// 先逐列映射（错误即 failed；此路径与管道 RenderCreateTable 同源）
 	type colDDL struct{ name, typ, mods string }
 	cols := make([]colDDL, 0, len(meta.Columns))
+	colTypes := make(map[string]string, len(meta.Columns)) // 列名→目标类型（LOB 索引判定）
 	skipped := map[string]bool{}
 	for _, c := range meta.Columns {
 		oracleType, err := d.MapType(meta.Table, c.Name, c.MySQLType)
@@ -93,6 +94,7 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 		if err != nil {
 			return nil, nil, fmt.Errorf("ddlsync: column %s.%s default %q: %w", meta.Table, c.Name, c.Default, err)
 		}
+		colTypes[c.Name] = oracleType
 		cols = append(cols, colDDL{name: d.QuoteIdentifier(nc(c.Name)), typ: oracleType, mods: mods})
 	}
 
@@ -163,13 +165,27 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 				colsUK = append(colsUK, d.QuoteIdentifier(nc(c)))
 			}
 			fmt.Fprintf(&sb, "  ,CONSTRAINT %s UNIQUE (%s)\n",
-				d.QuoteIdentifier(fitIdent(d, "UK_"+uk.Name)), strings.Join(colsUK, ", "))
+				// Oracle 约束名 schema 全局：MySQL 约束名仅表内唯一，跨表
+			// 同名（role_id 等）→ ORA-02264，UK 名纳入表名限定
+			d.QuoteIdentifier(fitIdent(d, "UK_"+meta.Table+"_"+uk.Name)), strings.Join(colsUK, ", "))
 		}
 		sb.WriteString(")")
 		stmts = append(stmts, Statement{Kind: "create", SQL: sb.String()})
 	}
 
-	// 二级索引（引用被跳过列的索引一并省略）
+	// 二级索引（引用被跳过列的索引一并省略）。
+	//   - 索引名 schema 全局：MySQL 索引名仅表内唯一，跨表同名（project_id
+	//     等）→ ORA-00955，索引名纳入表名限定（IDX_<table>_<idx>）；
+	//   - ORA-01408：列集与 PK/UK/已建索引完全相同的重复索引 Oracle 拒绝，
+	//     跳过并记 compat；
+	//   - ORA-02327：LOB 列不能建 B-tree 索引，跳过并记 compat。
+	indexedCols := [][]string{}
+	if len(pkNames) > 0 {
+		indexedCols = append(indexedCols, pkNames)
+	}
+	for _, uk := range validUKs {
+		indexedCols = append(indexedCols, uk.Columns)
+	}
 	for _, idx := range meta.Indexes {
 		if anySkipped(idx.Columns, skipped) {
 			continue
@@ -184,13 +200,34 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 			})
 			continue
 		}
+		if hasLobColumn(idx.Columns, colTypes) {
+			extra = append(extra, CompatItem{
+				Level:        "table",
+				PreCheckType: PreCheckDataType,
+				SourceValue:  fmt.Sprintf("INDEX %s", idx.Name),
+				TargetValue:  "",
+				Suggest:      "索引含 LOB 列，Oracle B-tree 不支持（ORA-02327）；已跳过，需要时可用 Oracle TEXT 或函数索引",
+			})
+			continue
+		}
+		if dupIndexColumns(idx.Columns, indexedCols) {
+			extra = append(extra, CompatItem{
+				Level:        "table",
+				PreCheckType: PreCheckDataType,
+				SourceValue:  fmt.Sprintf("INDEX %s", idx.Name),
+				TargetValue:  "",
+				Suggest:      "索引列集与主键/唯一约束/已建索引重复，Oracle 拒绝重复索引（ORA-01408）；已跳过",
+			})
+			continue
+		}
+		indexedCols = append(indexedCols, idx.Columns)
 		idxCols := make([]string, 0, len(idx.Columns))
 		for _, c := range idx.Columns {
 			idxCols = append(idxCols, d.QuoteIdentifier(nc(c)))
 		}
 		stmts = append(stmts, Statement{Kind: "index", SQL: fmt.Sprintf(
 			"CREATE INDEX %s ON %s (%s)",
-			d.QuoteIdentifier(fitIdent(d, "IDX_"+idx.Name)), tableName, strings.Join(idxCols, ", "))})
+			d.QuoteIdentifier(fitIdent(d, "IDX_"+meta.Table+"_"+idx.Name)), tableName, strings.Join(idxCols, ", "))})
 	}
 
 	// 注释（COMMENT ON，t2o 口径）
@@ -254,7 +291,25 @@ func columnMods(c ColumnMeta, oracleType string) (string, error) {
 			}
 			mods = fmt.Sprintf(" DEFAULT %d", n)
 		default:
-			mods = fmt.Sprintf(" DEFAULT '%s'", escapeSingleQuotes(def))
+			// 日期时间字面量默认（'0001-01-01 00:00:00' 等）：裸引号字面量
+			// 在 TIMESTAMP/DATE 列上走 NLS 隐式转换 → ORA-01847；改 ANSI
+			// 字面量 TIMESTAMP '...' / DATE '...'（leader 真库实证可过）。
+			if dateLitRe.MatchString(def) {
+				switch {
+				case strings.HasPrefix(oracleType, "TIMESTAMP"):
+					mods = fmt.Sprintf(" DEFAULT TIMESTAMP '%s'", def)
+				case oracleType == "DATE":
+					if len(def) == 10 { // DATE 字面量仅接受 YYYY-MM-DD
+						mods = fmt.Sprintf(" DEFAULT DATE '%s'", def)
+					} else { // DATE 列 + 带时间：TO_DATE 显式格式，不赌 NLS
+						mods = fmt.Sprintf(" DEFAULT TO_DATE('%s', 'YYYY-MM-DD HH24:MI:SS')", def)
+					}
+				default: // 非日期目标列：普通引号字面量（日期串只是巧合字符串）
+					mods = fmt.Sprintf(" DEFAULT '%s'", escapeSingleQuotes(def))
+				}
+			} else {
+				mods = fmt.Sprintf(" DEFAULT '%s'", escapeSingleQuotes(def))
+			}
 		}
 	}
 	if !c.Nullable {
@@ -269,6 +324,43 @@ var funcDefaultRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\(\d*\))?$`)
 
 func isFunctionDefault(def string) bool {
 	return funcDefaultRe.MatchString(def)
+}
+
+// dateLitRe 日期时间字面量默认（information_schema 对 date/datetime/
+// timestamp 列的默认值呈现）：YYYY-MM-DD[ HH:MM:SS[.fff]]。
+var dateLitRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2}(\.\d{1,9})?)?$`)
+
+// hasLobColumn 索引列集中含 LOB 目标类型列（B-tree 不能索引 LOB，ORA-02327）。
+func hasLobColumn(cols []string, colTypes map[string]string) bool {
+	for _, c := range cols {
+		switch colTypes[c] {
+		case "CLOB", "NCLOB", "BLOB":
+			return true
+		}
+	}
+	return false
+}
+
+// dupIndexColumns 列集与已有索引（PK/UK/已建二级索引）完全相同（ORA-01408）。
+func dupIndexColumns(cols []string, existing [][]string) bool {
+	for _, e := range existing {
+		if sameColumns(e, cols) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameColumns(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func escapeSingleQuotes(s string) string {
