@@ -49,6 +49,44 @@ type tiDBInfo struct {
 	table   string
 	pkCols  []string
 	autoInc map[string]bool // auto_increment 列名集合
+
+	// J2：非自增单列整数主键的顺序分配器（max(pk)+N）。随机值在已有
+	// 多行的表上撞唯一键（part_hash 实测 5 次随机重试仍冲突），顺序
+	// 分配对既有值与本轮内自身都保证不冲突。
+	seqPK       string // 启用顺序分配的主键列名（空 = 不启用）
+	seqUnsigned bool
+	seqMax      uint64 // 分配上限（类型值域）
+	seqNext     uint64 // 下一个待分配值
+	seqInit     bool   // 是否已从 MAX(pk) 初始化
+}
+
+// nextSeqPK 分配下一个主键值。首次调用查询 MAX(pk) 初始化基线，
+// 之后单调递增；超类型值域 fail-loud（不静默回退随机——那会重新
+// 引入碰撞）。每次调用（含 dup 重试）都前进，重试不会复用旧值。
+func (t *tiDBInfo) nextSeqPK(ctx context.Context) (interface{}, error) {
+	if !t.seqInit {
+		var nullMax sql.NullString
+		q := fmt.Sprintf("SELECT MAX(%s) FROM %s.%s",
+			quoteIdent(t.seqPK), quoteIdent(t.schema), quoteIdent(t.table))
+		if err := t.db.QueryRowContext(ctx, q).Scan(&nullMax); err != nil {
+			return nil, fmt.Errorf("dmlgen: query %s: %w", q, err)
+		}
+		start, err := parseMaxPKValue(nullMax.String)
+		if err != nil {
+			return nil, err
+		}
+		t.seqNext = start
+		t.seqInit = true
+	}
+	if t.seqNext > t.seqMax {
+		return nil, fmt.Errorf("dmlgen: pk %s sequential allocation exhausted at %d (type value range)", t.seqPK, t.seqNext)
+	}
+	v := t.seqNext
+	t.seqNext++
+	if t.seqUnsigned {
+		return v, nil
+	}
+	return int64(v), nil
 }
 
 // Run 执行一轮 DML 混合流量：连接 TiDB → 读元数据 → 按 I/U/D 各自数量
@@ -94,6 +132,19 @@ func Run(ctx context.Context, cfg Config) (*Stats, error) {
 	}
 	if len(tdb.pkCols) == 0 {
 		return nil, fmt.Errorf("dmlgen: %s.%s has no primary key (canal-json 需要 pk 定位行)", schema, cfg.Table)
+	}
+	// J2：非自增单列整数主键启用 max(pk)+N 顺序分配（随机生成在已有
+	// 多行的表上撞唯一键）。字符串/复合/非整数主键维持随机（碰撞概率
+	// 可忽略，dup-entry 重试兜底）。
+	if len(tdb.pkCols) == 1 && !autoInc[tdb.pkCols[0]] {
+		for _, c := range info.Columns {
+			if c.Name == tdb.pkCols[0] && isIntegerCol(c.MySQLType) {
+				tdb.seqPK = c.Name
+				tdb.seqUnsigned = strings.Contains(strings.ToLower(c.MySQLType), "unsigned")
+				tdb.seqMax = uint64(intMaxOf(baseTypeOf(c.MySQLType), tdb.seqUnsigned))
+				break
+			}
+		}
 	}
 
 	w := kafka.NewWriter(kafka.WriterConfig{
@@ -235,6 +286,15 @@ func doInsert(ctx context.Context, t *tiDBInfo, info *encoder.TableInfo, rng *ra
 	backoff := 100 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		vals := genRowValues(t, info, rng)
+		// J2：非自增整数主键覆盖随机值为顺序分配值（每次尝试都取新值，
+		// dup 重试不复用旧值）。
+		if t.seqPK != "" {
+			pkv, err := t.nextSeqPK(ctx)
+			if err != nil {
+				return nil, err
+			}
+			vals[t.seqPK] = pkv
+		}
 		cols := make([]string, 0, len(info.Columns))
 		args := make([]interface{}, 0, len(info.Columns))
 		for _, c := range info.Columns {

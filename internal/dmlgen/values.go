@@ -183,6 +183,47 @@ func randString(rng *rand.Rand, n int) string {
 	return string(b)
 }
 
+// baseTypeOf 取去修饰的基础类型名（"bigint unsigned" → "bigint"）。
+func baseTypeOf(mysqlType string) string {
+	mt := strings.ToLower(strings.TrimSpace(mysqlType))
+	if i := strings.IndexAny(mt, "( "); i > 0 {
+		return mt[:i]
+	}
+	return mt
+}
+
+// isIntegerCol 整数类型列（J2：非自增整数主键走 max+N 顺序分配）。
+func isIntegerCol(mysqlType string) bool {
+	switch baseTypeOf(mysqlType) {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
+		return true
+	}
+	return false
+}
+
+// parseMaxPKValue 把 MAX(pk) 的字符串结果解析为起始分配值（max+1）。
+// 负数最大值说明表内全是负 id，从 1 起步必然避让既有行；
+// 解析失败返回错误（fail-loud，不静默猜值）。
+func parseMaxPKValue(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 1, nil // 空表（MAX 为 NULL）
+	}
+	if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+		if v == ^uint64(0) {
+			return 0, fmt.Errorf("dmlgen: MAX(pk)=%d already at uint64 ceiling, no value left to allocate", v)
+		}
+		return v + 1, nil
+	}
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if v < 0 {
+			return 1, nil // 全负 id：正区间必然空闲
+		}
+		return uint64(v) + 1, nil
+	}
+	return 0, fmt.Errorf("dmlgen: cannot parse MAX(pk) value %q", s)
+}
+
 // isDupEntry 主键/唯一键冲突（MySQL 1062）。
 func isDupEntry(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "1062")

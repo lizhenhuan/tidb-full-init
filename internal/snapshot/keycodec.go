@@ -38,6 +38,20 @@ const (
 	flagFloat byte = 5 // memcomparable float64
 )
 
+// fillAbsentColumns 回填行数据中完全缺失的列（J1）：ALTER ADD COLUMN
+// 之前的旧行不含新列 ID（不在 nullIDs、也无数据）。TiDB fromBytes 语义
+// 为缺列回退默认值，一期统一回填 ""（NULL 语义）；非 NULL 默认列会在
+// Oracle 侧显式 ORA-01400 进 DLQ，不静默丢整行。
+// 必须在 fillPKFromKey 之后调用：聚簇主键列合法缺失（值在行键），
+// 先回填会挡住从 key 还原主键。
+func fillAbsentColumns(rowData map[string]string, columns []encoder.ColumnInfo) {
+	for _, col := range columns {
+		if _, ok := rowData[col.Name]; !ok {
+			rowData[col.Name] = ""
+		}
+	}
+}
+
 // fillPKFromKey 把行键中的主键值回填进 rowData 缺失的主键列。
 // 非聚簇表的主键列在 value 里已解码，无事可做。
 // 失败返回错误：全量快照阶段没有 DLQ 旁路，静默跳行等于悄悄丢整行数据，

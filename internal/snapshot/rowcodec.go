@@ -197,11 +197,12 @@ func DecodeRowNewFormat(value []byte, columns []encoder.ColumnInfo) (map[string]
 		}
 		end = dataStart + int(offsets[i])
 
-		if flags&rowFlagChecksum != 0 && i == len(notNullColIDs)-1 {
-			end -= 4 // CRC32 at end of value
-		}
-
-		if start >= len(value) || end > len(value) || start >= end {
+		// J1 修正（对齐 TiDB row.go fromBytes ground truth）：offsets 是只数
+		// 列数据的 END 偏移，checksum 尾巴（1B header + 4B CRC [+4B extra]）
+		// 位于数据之后——不能对最后一列做 end-=4 补偿，那会砍掉真实数据，
+		// ≤4 字节的最后一列（短串/整数）会被整体丢弃。
+		// start==end 是合法的零长值（空串列），只有真正越界才跳过。
+		if end > len(value) || start > end {
 			continue
 		}
 

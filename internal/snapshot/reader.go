@@ -164,6 +164,13 @@ func (r *Reader) scanPartition(
 				return
 			}
 
+			// J1：ALTER ADD COLUMN 之前的旧行可能整列缺失（不在 nullIDs、
+			// 也无数据，TiDB fromBytes 语义为回退默认值）。一期统一回填 ""
+			// （NULL 语义）；非 NULL 默认列会在 Oracle 侧显式 ORA-01400 进
+			// DLQ，不静默丢整行。必须在 fillPKFromKey 之后执行：聚簇主键列
+			// 合法缺失（值在行键），先回填会挡住从 key 还原主键。
+			fillAbsentColumns(rowData, tableInfo.Columns)
+
 			msg := encoder.NewInsertMessage(tableInfo)
 			msg.BuildTypeMapping(tableInfo.Columns)
 			msg.SetRowData(rowData)
