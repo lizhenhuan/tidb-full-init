@@ -292,3 +292,23 @@ func FormatValue(mysqlType string, value interface{}) string {
 		return fmt.Sprintf("%v", v)
 	}
 }
+
+// NewUpdateMessage 增量 UPDATE 消息（#t6 增量驱动用；与 TiCDC 形状一致：
+// Data=新整行，Old=仅变更列的旧值）。
+func NewUpdateMessage(tableInfo *TableInfo) *CanalMessage {
+	m := NewInsertMessage(tableInfo)
+	m.Type = "UPDATE"
+	return m
+}
+
+// NewDeleteMessage 增量 DELETE 消息（Data=被删整行，Old=nil）。
+func NewDeleteMessage(tableInfo *TableInfo) *CanalMessage {
+	m := NewInsertMessage(tableInfo)
+	m.Type = "DELETE"
+	return m
+}
+
+// SetOldData 设置变更前数据（UPDATE=变更列旧值；DELETE 不需要）。
+func (m *CanalMessage) SetOldData(old map[string]string) {
+	m.Old = old
+}
