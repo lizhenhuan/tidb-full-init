@@ -1,0 +1,16 @@
+{
+  "id": 0,
+  "database": "test",
+  "table": "tp_int",
+  "pkNames": ["id"],
+  "isDdl": false,
+  "type": "UPDATE",
+  "es": 1639624704627,
+  "ts": 1639624704670,
+  "sql": "",
+  "sqlType": {"id": -5},
+  "mysqlType": {"id": "bigint"},
+  "data": [{"id": "2", "ti_tinyint": "1"}],
+  "old": {"id": "1"},
+  "_tidb": {"commitTs": 16396247046269761}
+}

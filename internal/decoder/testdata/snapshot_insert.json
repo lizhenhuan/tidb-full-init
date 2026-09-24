@@ -1,0 +1,16 @@
+{
+  "id": 0,
+  "database": "shop",
+  "table": "orders",
+  "pkNames": ["order_id"],
+  "isDdl": false,
+  "type": "INSERT",
+  "es": 1695000000000,
+  "ts": 1695000000000,
+  "sql": "",
+  "sqlType": {"order_id": -5, "amount": 3, "memo": 2005, "payload": 2004},
+  "mysqlType": {"order_id": "bigint", "amount": "decimal(10,2)", "memo": "text", "payload": "blob"},
+  "data": [{"order_id": "42", "amount": "12.34", "memo": null, "payload": "aGVsbG8="}],
+  "old": null,
+  "_tidb": {"commitTs": 0}
+}

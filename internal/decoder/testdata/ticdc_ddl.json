@@ -1,0 +1,16 @@
+{
+  "id": 0,
+  "database": "test",
+  "table": "tp_int",
+  "pkNames": null,
+  "isDdl": true,
+  "type": "QUERY",
+  "es": 1639624704627,
+  "ts": 1639624704670,
+  "sql": "alter table tp_int add column c4 int",
+  "sqlType": null,
+  "mysqlType": null,
+  "data": null,
+  "old": null,
+  "_tidb": {"commitTs": 16396247046269763}
+}

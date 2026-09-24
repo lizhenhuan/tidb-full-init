@@ -5,6 +5,7 @@ go 1.25
 require (
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/segmentio/kafka-go v0.4.51
+	github.com/sijms/go-ora/v2 v2.9.0
 	github.com/tikv/client-go/v2 v2.0.7
 )
 

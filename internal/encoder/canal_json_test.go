@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
 )
@@ -158,26 +159,28 @@ func TestNewDDLMessage(t *testing.T) {
 }
 
 func TestEncodeBinaryValue(t *testing.T) {
+	// EncodeBinaryValue 自 Base64 化改造后输出标准 Base64
+	// （Flink Canal JSON 期望 BLOB/BINARY 为 Base64，见 canal_json.go 注释）。
 	tests := []struct {
 		name  string
 		input []byte
 		want  string
 	}{
-		{"tab", []byte{'\t'}, `\t`},
-		{"newline", []byte{'\n'}, `\n`},
-		{"carriage_return", []byte{'\r'}, `\r`},
-		{"ampersand", []byte{'&'}, `\u0026`},
-		{"less_than", []byte{'<'}, `\u003c`},
-		{"greater_than", []byte{'>'}, `\u003e`},
-		{"control_char", []byte{0x05}, `\u0005`},
-		{"printable", []byte("hello"), "hello"},
-		{"mixed", []byte{'a', '\n', 'b'}, "a\\nb"},
+		{"tab", []byte{'\t'}, "CQ=="},
+		{"newline", []byte{'\n'}, "Cg=="},
+		{"carriage_return", []byte{'\r'}, "DQ=="},
+		{"ampersand", []byte{'&'}, "Jg=="},
+		{"less_than", []byte{'<'}, "PA=="},
+		{"greater_than", []byte{'>'}, "Pg=="},
+		{"control_char", []byte{0x05}, "BQ=="},
+		{"printable", []byte("hello"), "aGVsbG8="},
+		{"mixed", []byte{'a', '\n', 'b'}, "YQpi"},
+		{"empty", nil, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := encoder.EncodeBinaryValue(tt.input)
-			// Note: want values use Go string representation where \\n = backslash + n
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -202,7 +205,12 @@ func TestFormatValue(t *testing.T) {
 	}
 
 	val = encoder.FormatValue("blob", []byte{0x00, 0x01})
-	if !strings.Contains(val, `\u0000`) {
-		t.Errorf("binary encoding should escape control chars: %q", val)
+	if val != encoder.EncodeBinaryValue([]byte{0x00, 0x01}) {
+		t.Errorf("binary value should be base64: %q", val)
+	}
+
+	val = encoder.FormatValue("datetime", time.Date(2026, 9, 24, 10, 30, 0, 0, time.UTC))
+	if val != "2026-09-24 10:30:00" {
+		t.Errorf("unexpected datetime format: %q", val)
 	}
 }
