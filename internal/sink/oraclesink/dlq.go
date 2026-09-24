@@ -42,12 +42,14 @@ func truncReason(r string) string {
 	return r
 }
 
+// 注意 bind 名不能用 :raw——go-ora 命名 bind 拒绝该名字（ORA-01745
+// invalid host/bind variable name，#t6 复审 F2 实测；:rawval 即成功）。
 const dlqMergeSQL = `MERGE INTO "kafka_dlq" t
 USING (SELECT :topic AS topic, :pid AS partition_id, :oid AS offset_id FROM dual) s
 ON (t."topic" = s.topic AND t."partition_id" = s.partition_id AND t."offset_id" = s.offset_id)
-WHEN MATCHED THEN UPDATE SET t."reason" = :reason, t."raw_payload" = :raw, t."created_at" = SYSTIMESTAMP
+WHEN MATCHED THEN UPDATE SET t."reason" = :reason, t."raw_payload" = :raw_payload, t."created_at" = SYSTIMESTAMP
 WHEN NOT MATCHED THEN INSERT ("topic","partition_id","offset_id","reason","raw_payload")
-VALUES (:topic, :pid, :oid, :reason, :raw)`
+VALUES (:topic, :pid, :oid, :reason, :raw_payload)`
 
 // Write 单事务写入一批死信（applier.DLQWriter 接口）。
 // 失败返回错误只影响日志可见性（applier 侧计数在前、不因 DLQ 失败回退位点）。
@@ -77,7 +79,7 @@ func (d *DLQ) Write(ctx context.Context, failures []sink.RowFailure) error {
 			sql.Named("pid", f.Partition),
 			sql.Named("oid", f.Offset),
 			sql.Named("reason", truncReason(f.Reason)),
-			sql.Named("raw", string(raw))); err != nil {
+			sql.Named("raw_payload", string(raw))); err != nil {
 			return classify(err)
 		}
 	}

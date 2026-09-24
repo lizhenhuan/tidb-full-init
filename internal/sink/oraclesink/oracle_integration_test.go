@@ -13,6 +13,7 @@ import (
 	goorav2 "github.com/sijms/go-ora/v2"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/model"
+	"github.com/lizhenhuan/tidb-full-init/internal/sink"
 )
 
 // 本地集成冒烟测试（M1.5 P0#4 用例）：连接用户与目标 schema 分离，
@@ -284,4 +285,55 @@ func sQueryOne(ctx context.Context, url string) (string, error) {
 		return "", fmt.Errorf("ping-query: %w", err)
 	}
 	return v, nil
+}
+
+// TestIntegrationDLQWrite：真实 Oracle 上的 DLQ 写入契约（#t6 复审 F2
+// 回归——bind 名 :raw 曾触发 ORA-01745，任何数据错误都静默丢失）。
+// 覆盖：写入成功、raw_payload/reason 落库、幂等（同坐标重写仍 1 条）。
+func TestIntegrationDLQWrite(t *testing.T) {
+	cfg := integrationEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	s, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.Close()
+	d := s.NewDLQ()
+	if err := d.EnsureTable(ctx); err != nil {
+		t.Fatalf("EnsureTable: %v", err)
+	}
+
+	fs := []sink.RowFailure{
+		{Topic: "f2.t", Partition: 0, Offset: 7, Reason: "number overflow: ORA-01438", Raw: []byte(`{"id":"1"}`)},
+		{Topic: "f2.t", Partition: 0, Offset: 8, Reason: "value too large: ORA-12899", Raw: []byte(`{"id":"2"}`)},
+	}
+	if err := d.Write(ctx, fs); err != nil {
+		t.Fatalf("DLQ write (F2 regression: bind name must not be :raw): %v", err)
+	}
+	// 幂等：同坐标重写（整窗重放场景）仍收敛为 1 条
+	if err := d.Write(ctx, fs[:1]); err != nil {
+		t.Fatalf("DLQ rewrite: %v", err)
+	}
+
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t`, sql.Named("t", "f2.t")).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("dlq rows = %d, want 2 (idempotent rewrite must not duplicate)", n)
+	}
+	var reason, raw string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT "reason", "raw_payload" FROM "kafka_dlq" WHERE "topic" = :t AND "offset_id" = :o`,
+		sql.Named("t", "f2.t"), sql.Named("o", int64(7))).Scan(&reason, &raw); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if reason != fs[0].Reason || raw != string(fs[0].Raw) {
+		t.Fatalf("reason/raw = %q/%q", reason, raw)
+	}
+
+	s.db.ExecContext(ctx, `DELETE FROM "kafka_dlq" WHERE "topic" = :t`, sql.Named("t", "f2.t"))
 }

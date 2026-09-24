@@ -10,6 +10,7 @@ package kafka
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -80,5 +81,46 @@ func TestE2EProducerThroughput(t *testing.T) {
 	}
 	if got != n {
 		t.Fatalf("read back %d/%d", got, n)
+	}
+}
+
+// TestE2EFreshTopicProduceRace：#t6 复审 F1 回归——多表批量里第 2 个
+// 新建 topic 的首条 produce 稳定报 [3] UnknownTopicOrPartition（创建→
+// 元数据可见性竞态）。EnsureTopic 现在轮询到分区有 leader 才返回，
+// Send 对码 3 退避重试兜底。
+func TestE2EFreshTopicProduceRace(t *testing.T) {
+	if os.Getenv("E2E_KAFKA") != "1" {
+		t.Skip("E2E_KAFKA != 1; skipping producer E2E (needs Docker)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	rp, err := redpanda.Run(ctx, "docker.redpanda.com/redpandadata/redpanda:v25.2.4")
+	if err != nil {
+		t.Fatalf("start redpanda: %v", err)
+	}
+	defer rp.Terminate(ctx)
+	broker, err := rp.KafkaSeedBroker(ctx)
+	if err != nil {
+		t.Fatalf("seed broker: %v", err)
+	}
+
+	// 复现形态：连续建两个 fresh topic，各自立即生产首条（修复前
+	// 第 2 个稳定 [3]）。为放大竞态跑 3 组。
+	for g := 0; g < 3; g++ {
+		for i := 0; i < 2; i++ {
+			topic := fmt.Sprintf("fresh-race-%d-%d-%d", g, i, time.Now().UnixNano())
+			if err := EnsureTopic(broker, topic, 1); err != nil {
+				t.Fatalf("EnsureTopic %s: %v", topic, err)
+			}
+			p, err := NewKafkaProducer(KafkaProducerConfig{Brokers: broker, Topic: topic, Acks: 1})
+			if err != nil {
+				t.Fatalf("producer %s: %v", topic, err)
+			}
+			if err := p.Send(ctx, &Message{Value: []byte("first")}); err != nil {
+				t.Fatalf("first produce on %s (F1 race): %v", topic, err)
+			}
+			p.Close()
+		}
 	}
 }
