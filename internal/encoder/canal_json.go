@@ -258,12 +258,30 @@ func IsBinaryType(mysqlType string) bool {
 		strings.HasPrefix(lower, "bit")
 }
 
+// isBitType BIT 列（数值语义：dialect 映射 Oracle NUMBER），位串按
+// 无符号整数呈现，不走 binary base64（见 FormatValue）。
+func isBitType(mysqlType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mysqlType)), "bit")
+}
+
 func FormatValue(mysqlType string, value interface{}) string {
 	if value == nil {
 		return ""
 	}
 	switch v := value.(type) {
 	case []byte:
+		if isBitType(mysqlType) {
+			// L11：BIT 文本协议读出的是大端位串（bit(16)=0x0100 →
+			// []byte{0x01,0x00}），必须按无符号整数输出十进制——与
+			// snapshot rowcodec 路径（decodeUintLE）、verify KindBit 同
+			// 口径。此前误走 IsBinaryType→base64，sink 把 base64 串绑给
+			// Oracle NUMBER 列抛 ORA-01722，UPDATE 整行进 DLQ。
+			var u uint64
+			for _, b := range v {
+				u = u<<8 | uint64(b)
+			}
+			return strconv.FormatUint(u, 10)
+		}
 		if IsBinaryType(mysqlType) {
 			return EncodeBinaryValue(v)
 		}

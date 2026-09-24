@@ -2,7 +2,12 @@ package dmlgen
 
 // J2：非自增主键顺序分配的纯函数单测（MAX 解析与类型判别）。
 
-import "testing"
+import (
+	"math/rand"
+	"regexp"
+	"strings"
+	"testing"
+)
 
 func TestParseMaxPKValue(t *testing.T) {
 	cases := []struct {
@@ -49,5 +54,45 @@ func TestIsIntegerCol(t *testing.T) {
 		if isIntegerCol(s) {
 			t.Errorf("isIntegerCol(%q) = true, want false", s)
 		}
+	}
+}
+
+// L11a：fsp>0 的 time/datetime 生成值必须带 fsp 位小数（含尾零口径），
+// 与 MySQL 文本显示逐位一致；fsp=0 无小数点。
+func TestGenValueFsp(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	hmsRe := regexp.MustCompile(`^\d{2}:\d{2}:\d{2}(\.\d+)?$`)
+	dtRe := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$`)
+	for i := 0; i < 200; i++ {
+		for mt, wantFracLen := range map[string]int{
+			"time(6)": 6, "time(3)": 3, "time": 0,
+			"datetime(6)": 6, "timestamp(3)": 3, "datetime": 0,
+		} {
+			v, _ := genValue(mt, rng).(string)
+			var frac string
+			if j := strings.LastIndex(v, "."); j >= 0 {
+				frac = v[j+1:]
+			}
+			if len(frac) != wantFracLen {
+				t.Fatalf("genValue(%q) = %q, frac len %d, want %d", mt, v, len(frac), wantFracLen)
+			}
+			re := hmsRe
+			if strings.HasPrefix(mt, "datetime") || strings.HasPrefix(mt, "timestamp") {
+				re = dtRe
+			}
+			if !re.MatchString(v) {
+				t.Fatalf("genValue(%q) = %q not matching %v", mt, v, re)
+			}
+		}
+	}
+}
+
+// L11a：JSON 生成值用 TiDB String() 分隔符（", "/": "），插入后源端读回
+// 的形态与消息一致（CLOB 逐字节比）。
+func TestGenValueJSONSpacing(t *testing.T) {
+	rng := rand.New(rand.NewSource(2))
+	v, _ := genValue("json", rng).(string)
+	if !strings.Contains(v, `"k": `) || !strings.Contains(v, `, "s": `) {
+		t.Fatalf("genValue(json) = %q, want TiDB spacing {\"k\": N, \"s\": \"...\"}", v)
 	}
 }

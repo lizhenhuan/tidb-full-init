@@ -25,9 +25,13 @@
 //	}
 //
 // expect-dlq（K3 口径）：对声明了期望死信的表，轮末按本轮 topic 机器断言
-// 「有损必须可见」——每个 ORA 码的行数与总行数都精确匹配（多余/缺失都
-// FAIL）。用于已知有损映射（如 decimal(65,30)→NUMBER(38,30) 溢出）的
-// 验收：损失行数落 DLQ 且 reason 可查，是 PASS 的前置可见性证据。
+// 「有损必须可见」。全量-only 精确匹配；增量轮（dml 活跃）随机数据可
+// 超发已声明码的死信，放宽为下限 + reason 白名单（见 assertDLQ L11c）。
+// 用于已知有损映射（如 decimal(65,30)→NUMBER(38,30) 溢出）的验收：
+// 损失行数落 DLQ 且 reason 可查，是 PASS 的前置可见性证据。
+//
+// dml.seed：非 0 = 固定种子（单轮复现用）；0 = 每轮按 轮次×100003+表序
+// 派生（L11d：固定种子跨轮重放同一批随机值，字符串 PK 表必撞 1062）。
 //
 // Oracle 口令可用环境变量 ORACLE_FREE_PASSWORD 兜底（leader 口径）。
 package main
@@ -244,6 +248,20 @@ func reportOK(rep *verify.Report, lossy int, sampled bool) bool {
 	return rep.MissingCount == int64(lossy)
 }
 
+// reportOKIncr 增量轮有损判定（L11c）：rowDiff+missing+extra ≤ 该表
+// 累计死信总数（全量预期死信 + 增量随机超发），抽样模式天然满足。
+// 未声明 expect-dlq 的表 dlqTotal=0，退化为 Equal() 强判。
+func reportOKIncr(rep *verify.Report, dlqTotal int64, sampled bool) bool {
+	if dlqTotal <= 0 {
+		return rep.Equal()
+	}
+	if sampled {
+		return true // 抽样不保证逐行覆盖，损失可见性由 assertDLQ 把关
+	}
+	affected := rep.RowDiffCount + rep.MissingCount + rep.ExtraCount
+	return affected <= dlqTotal
+}
+
 func containsTable(tables []tableEntry, key string) bool {
 	for _, te := range tables {
 		if te.db+"."+te.table == key {
@@ -254,15 +272,21 @@ func containsTable(tables []tableEntry, key string) bool {
 }
 
 // assertDLQ 机器校验「有损必须可见」（K3）：对 expect-dlq 声明的表，
-// 按本轮 topic（前缀唯一，天然限定本轮死信）断言两件事：
-//  1. 每个 ORA 码的行数（reason LIKE 匹配）与期望精确相等；
-//  2. 该表死信总行数等于期望之和（多出的未知 reason 也算 FAIL——
-//     「预期内的损失可见」与「没有预期外的损失」都要成立）。
+// 按本轮 topic（前缀唯一，天然限定本轮死信）断言：
+//  1. 每个 ORA 码的行数（reason LIKE 匹配）：全量-only 精确相等；
+//  2. 该表死信总行数 = 期望之和。
+//
+// L11c：增量轮（DML 活跃）dmlgen 随机值可再次触发已声明码的死信
+// （如对含超大 DECIMAL 行的 UPDATE 重放 ORA-01438），精确断言必假 FAIL。
+// 放宽为「下限 + 白名单」：各码 got ≥ want、total got ≥ want 之和、
+// 且每条 reason 必须命中某个已声明码——随机超发的损失可见且可解释，
+// 预期外的 reason（如 c_bit 误 base64 触发的 ORA-01722）仍 FAIL。
 //
 // 断言失败记入该表 dlqErr——独立于业务错误（L3）：预期死信本身会造成
 // 预期的 verify DIFF / 行数缺口，属业务侧已知结果，不得与之混叠，否则
 // 「机器断言通过」这一证据会被掩盖。汇总仍 FAIL、退出码 1，不断轮。
 func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, tables []tableEntry, results map[string]*tableResult) {
+	relax := dmlActive(bc)
 	byKey := make(map[string]tableEntry, len(tables))
 	for _, te := range tables {
 		byKey[te.db+"."+te.table] = te
@@ -284,7 +308,7 @@ func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, ta
 				r.dlqErr = wrapDLQErr(r.dlqErr, key, "query %s: %v", code, err)
 				continue
 			}
-			if got != n {
+			if (relax && got < n) || (!relax && got != n) {
 				r.dlqErr = wrapDLQErr(r.dlqErr, key, "%s want %d rows, got %d", code, n, got)
 			}
 			parts = append(parts, fmt.Sprintf("%s:%d", code, got))
@@ -296,17 +320,59 @@ func assertDLQ(ctx context.Context, ora *sql.DB, bc *batchCfg, prefix string, ta
 			r.dlqErr = wrapDLQErr(r.dlqErr, key, "query total: %v", err)
 			continue
 		}
-		if gotTotal != wantTotal {
-			r.dlqErr = wrapDLQErr(r.dlqErr, key, "total want %d rows (sum of codes), got %d — unexpected DLQ reasons exist", wantTotal, gotTotal)
+		if (relax && gotTotal < wantTotal) || (!relax && gotTotal != wantTotal) {
+			r.dlqErr = wrapDLQErr(r.dlqErr, key, "total want %d rows (sum of codes), got %d — declared loss not fully visible", wantTotal, gotTotal)
+		}
+		if relax && r.dlqErr == nil {
+			// 白名单：随机超发的死信 reason 必须仍属已声明码
+			rows, err := ora.QueryContext(ctx,
+				`SELECT "reason", COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t GROUP BY "reason"`,
+				sql.Named("t", topic))
+			if err != nil {
+				r.dlqErr = wrapDLQErr(r.dlqErr, key, "query reasons: %v", err)
+			} else {
+				for rows.Next() {
+					var reason string
+					var n int
+					if err := rows.Scan(&reason, &n); err != nil {
+						r.dlqErr = wrapDLQErr(r.dlqErr, key, "scan reason: %v", err)
+						break
+					}
+					if !reasonMatchesDeclared(reason, wantByCode) {
+						r.dlqErr = wrapDLQErr(r.dlqErr, key, "unexpected DLQ reason %q (%d rows) outside declared codes", reason, n)
+					}
+				}
+				rows.Close()
+			}
 		}
 		// dlqNote 只反映断言本身（L3）：OK 与否不搭业务错误。
 		if r.dlqErr == nil {
 			sort.Strings(parts)
-			r.dlqNote = fmt.Sprintf("OK(%s)", strings.Join(parts, ","))
+			mode := ""
+			if relax {
+				mode = ",lower-bound"
+			}
+			r.dlqNote = fmt.Sprintf("OK(%s%s)", strings.Join(parts, ","), mode)
 		} else {
 			r.dlqNote = fmt.Sprintf("FAIL(%v)", r.dlqErr)
 		}
 	}
+}
+
+// reasonMatchesDeclared reason 文本命中任一已声明码（与 per-code 查询
+// 的 LIKE %code% 同口径）。
+func reasonMatchesDeclared(reason string, wantByCode map[string]int) bool {
+	for code := range wantByCode {
+		if strings.Contains(reason, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// dmlActive 本轮是否执行增量 DML。
+func dmlActive(bc *batchCfg) bool {
+	return bc.DML.Inserts > 0 || bc.DML.Updates > 0 || bc.DML.Deletes > 0
 }
 
 // wrapDLQErr 追加 expect-dlq 断言错误，保留该表既有失败信息。
@@ -410,8 +476,8 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 	}
 
 	// ---- Step 4: 增量轮（可选）----
-	if bc.DML.Inserts > 0 || bc.DML.Updates > 0 || bc.DML.Deletes > 0 {
-		for _, te := range tables {
+	if dmlActive(bc) {
+		for idx, te := range tables {
 			key := te.db + "." + te.table
 			results[key].stage = "incr-dml"
 			if results[key].err != nil {
@@ -419,11 +485,17 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 				continue // 全量已败，增量无意义
 			}
 			topic := prefix + te.db + "-" + te.table
+			// L11d：seed=0 时跨轮复用同一随机序列，字符串 PK 表必然重放
+			// 出重复值撞 1062；改为轮次+表序派生（单轮内仍确定可复现）。
+			seed := bc.DML.Seed
+			if seed == 0 {
+				seed = round*100003 + int64(idx)
+			}
 			st, err := dmlgen.Run(ctx, dmlgen.Config{
 				DSN: withDatabase(bc.TiDBDSN, te.db),
 				Table: te.table, Brokers: []string{bc.KafkaBootstrapServer}, Topic: topic,
 				NInsert: bc.DML.Inserts, NUpdate: bc.DML.Updates, NDelete: bc.DML.Deletes,
-				Seed: bc.DML.Seed,
+				Seed: seed,
 			})
 			if err != nil {
 				results[key].err = fmt.Errorf("dmlgen: %w", err)
@@ -433,20 +505,33 @@ func runRound(ctx context.Context, bc *batchCfg, dsn *mysql.Config, tables []tab
 			// 终态行数 = 全量 + ins - del（UPDATE 不变）
 			want := results[key].rows + int64(st.Inserted) - int64(st.Deleted)
 			results[key].stage = "incr-consume"
-			if err := waitConsume(te, want); err != nil {
+			// L11c：随机值可能新增死信（如对超大 DECIMAL 行的 UPDATE 撞
+			// ORA-01438），行数永远到不了 want——收敛条件放宽为
+			// 「缺口 ≤ 本轮新增死信数」（每条死信恰好解释一行缺口）。
+			dlqNow, err := waitForRowsIncr(ctx, ora, bc.TargetSchema, te, topic, want, bc.ConsumeTimeoutSec)
+			if err != nil {
 				results[key].err = err
 				continue
 			}
-			results[key].rows = want
+			results[key].rows = want - dlqNow.shortfall
 			rep, err := verifyTable(ctx, bc, dsn, te)
 			if err != nil {
 				results[key].err = err
 				continue
 			}
-			// 有损表增量：DLQ 掉的行在源端仍存在，缺失数延续全量口径
-			// （= 预期死信数；抽样 ≤）。注意 dmlgen 随机值可能再次触发同码
-			// 死信，此时轮末 expect-dlq 总数断言会 FAIL——有损表建议 skip 增量。
-			results[key].incrEqual = reportOK(rep, expectDLQTotal(bc, key), bc.Sample > 0)
+			// L11c：增量有损判定放宽为「损失全部可见且可解释」——
+			// rowDiff+missing+extra ≤ 该表累计死信总数（每条死信至多
+			// 损伤一行；死信 reason 白名单由轮末 assertDLQ 把关，预期外
+			// 码仍 FAIL）。真 bug（如 c_bit 误 base64 的 18 处假 DIFF）
+			// 远超死信数，必被拦下。
+			var totalDLQ int64
+			if err := ora.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t`,
+				sql.Named("t", topic)).Scan(&totalDLQ); err != nil {
+				results[key].err = fmt.Errorf("query dlq total: %w", err)
+				continue
+			}
+			results[key].incrEqual = reportOKIncr(rep, totalDLQ, bc.Sample > 0)
 			if !results[key].incrEqual {
 				logReport(key+" (incr)", rep)
 			}
@@ -538,6 +623,63 @@ func waitForRows(ctx context.Context, ora *sql.DB, schema string, te tableEntry,
 		}
 	}
 	return fmt.Errorf("consume timeout: %s.%s rows=%d want=%d", schema, te.table, last, want)
+}
+
+// incrConsumeState 增量消费收敛后的状态：shortfall = want - 实际行数，
+// 由本轮新增死信解释（每条死信至多造成一行缺口）。
+type incrConsumeState struct {
+	shortfall int64
+	dlqIncr   int64
+}
+
+// waitForRowsIncr 增量轮 count 轮询（L11c）：随机死信使行数到不了
+// want，收敛条件 = 行数到位，或（缺口 ≤ 新增死信数 且 状态已稳定——
+// 行数与死信数连续 stablePolls 次不变，避免在批中途误判收敛）。
+func waitForRowsIncr(ctx context.Context, ora *sql.DB, schema string, te tableEntry, topic string, want int64, timeoutSec int) (incrConsumeState, error) {
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s"`, schema, te.table)
+	dlqQ := `SELECT COUNT(*) FROM "kafka_dlq" WHERE "topic" = :t`
+	var baseDLQ int64
+	if err := ora.QueryRowContext(ctx, dlqQ, sql.Named("t", topic)).Scan(&baseDLQ); err != nil && !isOracleNotFound(err) {
+		// 死信表可能尚未建（无死信路径），按 0 起步
+		baseDLQ = 0
+	}
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	var last, lastDLQ int64 = -1, baseDLQ
+	stable := 0
+	const stablePolls = 6 // 6×500ms = 3s 无变化
+	for time.Now().Before(deadline) {
+		var n int64
+		if err := ora.QueryRowContext(ctx, q).Scan(&n); err != nil {
+			if !isOracleNotFound(err) {
+				return incrConsumeState{}, fmt.Errorf("count %s.%s: %w", schema, te.table, err)
+			}
+			n = -2
+		}
+		var dlq int64
+		_ = ora.QueryRowContext(ctx, dlqQ, sql.Named("t", topic)).Scan(&dlq)
+		if n == want {
+			return incrConsumeState{shortfall: 0, dlqIncr: dlq - baseDLQ}, nil
+		}
+		if n == last && dlq == lastDLQ {
+			stable++
+		} else {
+			stable = 0
+		}
+		if stable >= stablePolls && n >= 0 {
+			shortfall := want - n
+			if shortfall <= dlq-baseDLQ {
+				return incrConsumeState{shortfall: shortfall, dlqIncr: dlq - baseDLQ}, nil
+			}
+		}
+		last, lastDLQ = n, dlq
+		select {
+		case <-ctx.Done():
+			return incrConsumeState{}, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return incrConsumeState{}, fmt.Errorf("consume timeout: %s.%s rows=%d want=%d (unexplained shortfall, dlqIncr=%d)",
+		schema, te.table, last, want, lastDLQ-baseDLQ)
 }
 
 func isOracleNotFound(err error) bool {

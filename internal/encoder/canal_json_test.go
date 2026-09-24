@@ -223,4 +223,20 @@ func TestFormatValue(t *testing.T) {
 	if val != "2026-09-24 10:30:05.1" {
 		t.Errorf("unexpected timestamp(6) format: %q", val)
 	}
+
+	// L11：BIT 文本协议读出大端位串 → 无符号十进制（不是 base64）。
+	// 误走 base64 会把串绑给 Oracle NUMBER 抛 ORA-01722 整行进 DLQ。
+	val = encoder.FormatValue("bit(16)", []byte{0x01, 0x00})
+	if val != "256" {
+		t.Errorf("bit(16) 0x0100 should be 256, got %q", val)
+	}
+	val = encoder.FormatValue("bit", []byte{0x00})
+	if val != "0" {
+		t.Errorf("bit 0x00 should be 0, got %q", val)
+	}
+	// binary/varbinary 仍走 base64，不受 BIT 分支影响。
+	val = encoder.FormatValue("binary(2)", []byte{0x01, 0x00})
+	if val != encoder.EncodeBinaryValue([]byte{0x01, 0x00}) {
+		t.Errorf("binary(2) should stay base64, got %q", val)
+	}
 }

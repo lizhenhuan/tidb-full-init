@@ -45,11 +45,16 @@ func genValue(mysqlType string, rng *rand.Rand) interface{} {
 	case "date":
 		return fmt.Sprintf("20%02d-%02d-%02d", rng.Intn(25), rng.Intn(12)+1, rng.Intn(28)+1)
 	case "datetime", "timestamp":
-		return fmt.Sprintf("20%02d-%02d-%02d %02d:%02d:%02d",
+		// L11a：fsp>0 必须带小数位（MySQL 文本口径含尾零），否则
+		// time(6)/datetime(6) 列源端显示 .xxxxxx 而消息/目标端无小数，
+		// verify 侧（TIME 按 KindString 逐字节比）必假 DIFF。
+		s := fmt.Sprintf("20%02d-%02d-%02d %02d:%02d:%02d",
 			rng.Intn(25), rng.Intn(12)+1, rng.Intn(28)+1,
 			rng.Intn(24), rng.Intn(60), rng.Intn(60))
+		return s + fracDigits(mt, rng)
 	case "time":
-		return fmt.Sprintf("%02d:%02d:%02d", rng.Intn(24), rng.Intn(60), rng.Intn(60))
+		return fmt.Sprintf("%02d:%02d:%02d", rng.Intn(24), rng.Intn(60), rng.Intn(60)) +
+			fracDigits(mt, rng)
 	case "year":
 		return 1990 + rng.Intn(50)
 	case "char", "varchar", "text", "tinytext", "mediumtext", "longtext":
@@ -73,11 +78,41 @@ func genValue(mysqlType string, rng *rand.Rand) interface{} {
 	case "bit", "boolean", "bool":
 		return rng.Intn(2)
 	case "json":
-		return fmt.Sprintf(`{"k":%d,"s":"%s"}`, rng.Intn(1000), randString(rng, 8))
+		// L11a：TiDB json String() 输出 ", "/": " 分隔（L8c），插入后
+		// 源端读回即该形态；消息必须同口径，否则 CLOB 逐字节比假 DIFF。
+		return fmt.Sprintf(`{"k": %d, "s": "%s"}`, rng.Intn(1000), randString(rng, 8))
 	default:
 		// 未知类型：给短字符串（宁可在 TiDB 报错暴露，不静默跳过）
 		return randString(rng, 8)
 	}
+}
+
+// fracDigits 按 column_type 的 fsp 生成定点小数位（"time(6)" → 6 位；
+// fsp=0/非法 → 空串）。MySQL 显示口径 fsp>0 恒输出 fsp 位（含尾零），
+// 与 snapshot formatDuration 一致。
+func fracDigits(mysqlType string, rng *rand.Rand) string {
+	fsp := 0
+	if i := strings.Index(mysqlType, "("); i >= 0 {
+		rest := mysqlType[i+1:]
+		if j := strings.Index(rest, ")"); j > 0 {
+			if n, err := strconv.Atoi(rest[:j]); err == nil {
+				fsp = n
+			}
+		}
+	}
+	if fsp <= 0 || fsp > 6 {
+		return ""
+	}
+	micro := rng.Intn(1_000_000)
+	return fmt.Sprintf(".%0*d", fsp, micro/intPow(10, 6-fsp))
+}
+
+func intPow(base, exp int) int {
+	r := 1
+	for i := 0; i < exp; i++ {
+		r *= base
+	}
+	return r
 }
 
 // mutateValue 对已存在值生成一个"不同"的新值（UPDATE 用）。
