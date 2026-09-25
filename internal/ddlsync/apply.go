@@ -135,7 +135,7 @@ func CheckOwnerSchema(ctx context.Context, oraDB *sql.DB, targetSchema string) e
 }
 
 func syncOne(ctx context.Context, in *Introspector, oraDB *sql.DB, d *oracle.Dialect, cfg RunConfig, table string) TableResult {
-	meta, err := in.FetchTable(cfg.Database, table)
+	meta, err := in.FetchTable(ctx, cfg.Database, table)
 	if err != nil {
 		return TableResult{Table: table, Status: StatusFailed, ErrorText: err.Error()}
 	}

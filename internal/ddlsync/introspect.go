@@ -6,12 +6,16 @@
 package ddlsync
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
 )
 
 // Introspector TiDB 元数据读取器（db 为已连通的 *sql.DB，mysql 驱动）。
+// 所有查询走 ctx 变体（console 预览挂起现场：非 ctx 的 db.Query 内部
+// 用 context.Background()，handler 的 120s 超时到不了这里，连接
+// 黑洞时客户端永久挂起）。
 type Introspector struct {
 	db *sql.DB
 }
@@ -22,10 +26,10 @@ func NewIntrospector(db *sql.DB) *Introspector { return &Introspector{db: db} }
 // FetchTable 读单表完整元数据（列按 ORDINAL_POSITION）。
 // 表不存在或不是 BASE TABLE（视图一期不转换）返回 (nil, nil)，
 // 调用方按 skipped 处理。
-func (in *Introspector) FetchTable(database, table string) (*TableMetaFull, error) {
+func (in *Introspector) FetchTable(ctx context.Context, database, table string) (*TableMetaFull, error) {
 	var tableType string
 	var comment, tblCollation sql.NullString
-	err := in.db.QueryRow(
+	err := in.db.QueryRowContext(ctx,
 		`SELECT TABLE_TYPE, TABLE_COMMENT, TABLE_COLLATION
 		 FROM information_schema.TABLES
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, database, table).
@@ -48,7 +52,7 @@ func (in *Introspector) FetchTable(database, table string) (*TableMetaFull, erro
 		Charset:   charsetOfCollation(tblCollation.String),
 	}
 
-	cols, err := in.fetchColumns(database, table)
+	cols, err := in.fetchColumns(ctx, database, table)
 	if err != nil {
 		return nil, err
 	}
@@ -59,26 +63,26 @@ func (in *Introspector) FetchTable(database, table string) (*TableMetaFull, erro
 		}
 	}
 
-	uniques, indexes, err := in.fetchIndexes(database, table)
+	uniques, indexes, err := in.fetchIndexes(ctx, database, table)
 	if err != nil {
 		return nil, err
 	}
 	meta.Uniques, meta.Indexes = uniques, indexes
 
-	fks, err := in.fetchFKs(database, table)
+	fks, err := in.fetchFKs(ctx, database, table)
 	if err != nil {
 		return nil, err
 	}
 	meta.ForeignKeys = fks
 
-	if err := in.fetchPartition(database, table, meta); err != nil {
+	if err := in.fetchPartition(ctx, database, table, meta); err != nil {
 		return nil, err
 	}
 	return meta, nil
 }
 
-func (in *Introspector) fetchColumns(database, table string) ([]ColumnMeta, error) {
-	rows, err := in.db.Query(
+func (in *Introspector) fetchColumns(ctx context.Context, database, table string) ([]ColumnMeta, error) {
+	rows, err := in.db.QueryContext(ctx,
 		`SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT,
 		        COLUMN_COMMENT, IFNULL(CHARACTER_SET_NAME,''), IFNULL(COLLATION_NAME,''),
 		        COLUMN_KEY, IFNULL(EXTRA,'')
@@ -112,8 +116,8 @@ func (in *Introspector) fetchColumns(database, table string) ([]ColumnMeta, erro
 	return cols, rows.Err()
 }
 
-func (in *Introspector) fetchIndexes(database, table string) (uniques, indexes []IndexMeta, err error) {
-	rows, err := in.db.Query(
+func (in *Introspector) fetchIndexes(ctx context.Context, database, table string) (uniques, indexes []IndexMeta, err error) {
+	rows, err := in.db.QueryContext(ctx,
 		`SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
 		 FROM information_schema.STATISTICS
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -155,8 +159,8 @@ func (in *Introspector) fetchIndexes(database, table string) (uniques, indexes [
 	return uniques, indexes, rows.Err()
 }
 
-func (in *Introspector) fetchFKs(database, table string) ([]FKMeta, error) {
-	rows, err := in.db.Query(
+func (in *Introspector) fetchFKs(ctx context.Context, database, table string) ([]FKMeta, error) {
+	rows, err := in.db.QueryContext(ctx,
 		`SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA,
 		        k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME,
 		        IFNULL(r.DELETE_RULE,'NO ACTION'), IFNULL(r.UPDATE_RULE,'NO ACTION')
@@ -199,9 +203,9 @@ func (in *Introspector) fetchFKs(database, table string) ([]FKMeta, error) {
 
 // fetchPartition 分区判定 + 方法/表达式（P1 只记录兼容项；P2.5 落地
 // RANGE/HASH/LIST → Oracle 语法转换）。
-func (in *Introspector) fetchPartition(database, table string, meta *TableMetaFull) error {
+func (in *Introspector) fetchPartition(ctx context.Context, database, table string, meta *TableMetaFull) error {
 	var method, expr sql.NullString
-	err := in.db.QueryRow(
+	err := in.db.QueryRowContext(ctx,
 		`SELECT PARTITION_METHOD, IFNULL(PARTITION_EXPRESSION,'')
 		 FROM information_schema.PARTITIONS
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
