@@ -166,6 +166,20 @@ func Convert(meta *TableMetaFull, d *oracle.Dialect, opts ConvertOptions) ([]Sta
 				})
 				continue
 			}
+			// ORA-02329：UNIQUE 成员含 LOB 目标类型列（TEXT 前缀唯一索引
+			// 形态：UNIQUE KEY query (query(100)) → 目标 CLOB 不能唯一，
+			// tiki_menu_options/t2ark_log_profiling 实测）——与二级索引
+			// 的 ORA-02327 同族，剔除并记 compat。
+			if hasLobColumn(uk.Columns, colTypes) {
+				extra = append(extra, CompatItem{
+					Level:        "table",
+					PreCheckType: PreCheckDataType,
+					SourceValue:  fmt.Sprintf("UNIQUE INDEX %s", uk.Name),
+					TargetValue:  "",
+					Suggest:      "唯一约束含 LOB 列，Oracle 不支持（ORA-02329）；已跳过，需要时可用 Oracle TEXT 索引改写",
+				})
+				continue
+			}
 			// ORA-02261（#t14）：内联 UNIQUE 列集与 PK/已生成 UNIQUE 精确
 			// 相同时 Oracle 拒绝（northwind.purchase_orders：PK(id) +
 			// UNIQUE INDEX id(id)，生成器/ORM 常见）——与二级索引的

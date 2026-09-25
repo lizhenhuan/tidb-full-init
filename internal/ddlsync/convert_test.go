@@ -313,6 +313,35 @@ func TestSkipDuplicateUniqueConstraint(t *testing.T) {
 	}
 }
 
+// TestSkipLobUniqueConstraint P2 钉子（#t12 prisma_mysql 扫 ORA-02329）：
+// TEXT 前缀唯一索引（UNIQUE KEY query (query(100)) 形态）→ 目标 CLOB
+// 不能唯一约束（tiki_menu_options/t2ark_log_profiling 实测）——内联 UK
+// 生成段必须像二级索引段（ORA-02327）一样剔除 LOB 成员并记 compat。
+func TestSkipLobUniqueConstraint(t *testing.T) {
+	m := goldenMeta() // note 列目标映射 CLOB
+	m.Uniques = []IndexMeta{
+		{Name: "uk_note", Columns: []string{"note"}},      // LOB 成员 → 剔除
+		{Name: "order_no", Columns: []string{"order_no"}}, // 正常 UK，保留
+	}
+	stmts, extra, err := Convert(m, oracle.NewWithIdentLimit(128), ConvertOptions{TargetSchema: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := joinStatements(stmts)
+	if n := strings.Count(joined, "CONSTRAINT"); n != 2 { // PK + 仅一条正常 UK
+		t.Fatalf("want exactly PK + 1 UNIQUE constraint, got %d:\n%s", n, joined)
+	}
+	if strings.Contains(joined, "UK_orders_uk_note") {
+		t.Fatalf("LOB-member UK must be dropped:\n%s", joined)
+	}
+	if !strings.Contains(joined, `"UK_orders_order_no"`) {
+		t.Fatalf("normal UK must be kept:\n%s", joined)
+	}
+	if len(extra) != 1 || !strings.Contains(extra[0].Suggest, "ORA-02329") {
+		t.Fatalf("want 1 ORA-02329 compat item, got %d: %+v", len(extra), extra)
+	}
+}
+
 // TestIndexConstraintNamesTableQualified P1 钉子（#t12 扫描 ORA-00955/
 // ORA-02264）：Oracle 索引名与约束名 schema 全局，MySQL 表内同名的
 // 索引/UK 跨表必撞——生成名必须纳入表名限定，两表互不相同。
