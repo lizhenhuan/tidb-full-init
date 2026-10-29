@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -26,13 +27,11 @@ type KafkaProducerConfig struct {
 	BatchSize     int
 	LingerMs      int
 	MaxAttempts   int
+	AsyncMode     bool
 }
 
 func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
-	brokers := strings.Split(cfg.Brokers, ",")
-	for i := range brokers {
-		brokers[i] = strings.TrimSpace(brokers[i])
-	}
+	brokers := normalizeBrokers(cfg.Brokers)
 
 	if cfg.Topic == "" {
 		return nil, fmt.Errorf("kafka topic is required")
@@ -76,11 +75,12 @@ func NewKafkaProducer(cfg KafkaProducerConfig) (*KafkaProducer, error) {
 		RequiredAcks: acks,
 		Compression:  compression,
 		MaxAttempts:  maxAttempts,
-		Async:        false,
+		Async:        cfg.AsyncMode,
+		BatchTimeout: 200 * time.Millisecond,
 	}
 
-	log.Printf("[kafka] producer created: brokers=%v topic=%s batch=%d compression=%s",
-		brokers, cfg.Topic, batchSize, cfg.Compression)
+	log.Printf("[kafka] producer created: brokers=%v topic=%s batch=%d compression=%s async=%v",
+		brokers, cfg.Topic, batchSize, cfg.Compression, cfg.AsyncMode)
 
 	return &KafkaProducer{writer: w}, nil
 }
@@ -97,44 +97,72 @@ func (p *KafkaProducer) Send(ctx context.Context, msg *Message) error {
 	return nil
 }
 
+// normalizeBrokers strips protocol prefixes and splits comma-separated addresses.
+func normalizeBrokers(raw string) []string {
+	// Strip common URL prefixes
+	raw = strings.TrimPrefix(raw, "kafka://")
+	raw = strings.TrimPrefix(raw, "kafka:")
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
 // EnsureTopic creates a Kafka topic if it does not exist.
 func EnsureTopic(brokers string, topic string, partitions int) error {
-	conn, err := kafka.Dial("tcp", brokers)
-	if err != nil {
-		return fmt.Errorf("connect to kafka: %w", err)
-	}
-	defer conn.Close()
-
-	controller, err := conn.Controller()
-	if err != nil {
-		return fmt.Errorf("get kafka controller: %w", err)
+	brokerList := normalizeBrokers(brokers)
+	if len(brokerList) == 0 {
+		return fmt.Errorf("no kafka brokers specified")
 	}
 
-	controllerConn, err := kafka.Dial("tcp", fmt.Sprintf("%s:%d", controller.Host, controller.Port))
-	if err != nil {
-		return fmt.Errorf("connect to kafka controller: %w", err)
-	}
-	defer controllerConn.Close()
-
-	topicConfigs := []kafka.TopicConfig{{
-		Topic:             topic,
-		NumPartitions:     partitions,
-		ReplicationFactor: 1,
-	}}
-
-	err = controllerConn.CreateTopics(topicConfigs...)
-	if err != nil {
-		// TopicAlreadyExists is not an error in our case
-		if !strings.Contains(err.Error(), "TopicExists") &&
-			!strings.Contains(err.Error(), "already exists") {
-			return fmt.Errorf("create topic %s: %w", topic, err)
+	var lastErr error
+	for _, broker := range brokerList {
+		conn, err := kafka.Dial("tcp", broker)
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		log.Printf("[kafka] topic %s already exists, skipping creation", topic)
+
+		controller, err := conn.Controller()
+		conn.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("get kafka controller: %w", err)
+			continue
+		}
+
+		controllerConn, err := kafka.Dial("tcp", fmt.Sprintf("%s:%d", controller.Host, controller.Port))
+		if err != nil {
+			lastErr = fmt.Errorf("connect to kafka controller: %w", err)
+			continue
+		}
+		defer controllerConn.Close()
+
+		topicConfigs := []kafka.TopicConfig{{
+			Topic:             topic,
+			NumPartitions:     partitions,
+			ReplicationFactor: 1,
+		}}
+
+		err = controllerConn.CreateTopics(topicConfigs...)
+		if err != nil {
+			if strings.Contains(err.Error(), "TopicExists") ||
+				strings.Contains(err.Error(), "already exists") {
+				log.Printf("[kafka] topic %s already exists, skipping creation", topic)
+				return nil
+			}
+			lastErr = fmt.Errorf("create topic %s: %w", topic, err)
+			continue
+		}
+
+		log.Printf("[kafka] topic %s created (partitions=%d)", topic, partitions)
 		return nil
 	}
-
-	log.Printf("[kafka] topic %s created (partitions=%d)", topic, partitions)
-	return nil
+	return fmt.Errorf("ensure topic %s failed (tried %d brokers): %w", topic, len(brokerList), lastErr)
 }
 
 func (p *KafkaProducer) Close() error {

@@ -1,4 +1,5 @@
 tidb-full-init
 tidb-verify
+kafka-consume
 
 .DS_Store

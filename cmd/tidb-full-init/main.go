@@ -7,6 +7,9 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/config"
 	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
@@ -42,7 +45,7 @@ func init() {
 	flag.StringVar(&password, "password", "", "TiDB password (required)")
 	flag.StringVar(&database, "database", "test", "Database name")
 	flag.StringVar(&tablesFlag, "tables", "", "Tables to initialize (comma-separated)")
-	flag.StringVar(&kafkaBootstrap, "kafka-bootstrap", "127.0.0.1:9092", "Kafka bootstrap servers")
+	flag.StringVar(&kafkaBootstrap, "kafka-bootstrap", "127.0.0.1:9092", "Kafka bootstrap servers (supports domain, kafka:// prefix, comma-separated list)")
 	flag.StringVar(&kafkaTopicPrefix, "kafka-topic-prefix", "tidb-data-", "Kafka topic prefix (topic = prefix + db + '-' + table)")
 	flag.StringVar(&kafkaTopic, "kafka-topic", "", "Kafka topic (fixed; all tables sent to this single topic, overrides -kafka-topic-prefix)")
 	flag.IntVar(&parallelism, "parallelism", 4, "Parallel scan workers per table")
@@ -129,6 +132,17 @@ func main() {
 	reader := snapshot.NewReader(tikvClient)
 	ctx := context.Background()
 
+	// Fetch a single TSO for consistency with TiCDC
+	effectiveTSO := startTSO
+	if effectiveTSO == 0 && !mockMode {
+		var err error
+		effectiveTSO, err = tikvClient.GetTimestamp(ctx)
+		if err != nil {
+			log.Fatalf("Get snapshot TSO: %v", err)
+		}
+	}
+	log.Printf("=== Snapshot TSO: %d (use --start-ts=%d with TiCDC for incremental sync) ===", effectiveTSO, effectiveTSO)
+
 	for _, tc := range cfg.Tables {
 		for _, tableName := range tc.Tables {
 			topic := tc.Topic
@@ -152,21 +166,22 @@ func main() {
 					Topic:       topic,
 					Acks:        1,
 					Compression: "snappy",
-					BatchSize:   100,
+					BatchSize:   2000,
 					MaxAttempts: 3,
+					AsyncMode:   true,
 				})
 				if err != nil {
 					log.Fatalf("Create Kafka producer: %v", err)
 				}
-				log.Printf("Kafka producer connected to %s, topic=%s", cfg.KafkaBootstrapServers, topic)
+				log.Printf("Kafka producer connected to %s, topic=%s (async batch=2000)", cfg.KafkaBootstrapServers, topic)
 			}
 
 			scanCfg := &snapshot.Config{
 				Database:    tc.Database,
 				TableName:   tableName,
 				Parallelism: tc.Parallelism,
-				BatchSize:   500,
-				StartTSO:    startTSO,
+				BatchSize:   2000,
+				StartTSO:    effectiveTSO,
 			}
 
 			var tableInfo *encoder.TableInfo
@@ -204,32 +219,72 @@ func main() {
 		}
 
 		var totalRowCount int64
-		for _, scanID := range scanIDs {
+		partitionStartTime := time.Now()
+
+		// Scan all partitions concurrently
+		if len(scanIDs) == 1 {
+			// Single partition: scan inline
 			label := fmt.Sprintf("%s.%s", tc.Database, tableName)
-			if len(scanIDs) > 1 {
-				label = fmt.Sprintf("%s.%s [pid=%d]", tc.Database, tableName, scanID)
-			}
 			log.Printf("Starting: %s (topic=%s)", label, topic)
 
-			rowCount, err := reader.ScanTable(ctx, scanCfg, scanID, tableInfo, kafkaProducer, topic)
+			rowCount, err := reader.ScanTable(ctx, scanCfg, scanIDs[0], tableInfo, kafkaProducer, topic)
 			if err != nil {
 				log.Printf("[%s] ERROR: %v", label, err)
 				kafkaProducer.Close()
 				os.Exit(1)
 			}
 
-			log.Printf("[%s] Done: %d rows -> topic %s", label, rowCount, topic)
-			totalRowCount += rowCount
+			elapsed := time.Since(partitionStartTime)
+			log.Printf("[%s] Done: %d rows -> topic %s (elapsed=%s)", label, rowCount, topic, elapsed.Round(time.Second))
+			totalRowCount = rowCount
+		} else {
+			// Multiple partitions: scan concurrently
+			log.Printf("[%s.%s] Scanning %d partitions in parallel", tc.Database, tableName, len(scanIDs))
+			var wg sync.WaitGroup
+			errCh := make(chan error, len(scanIDs))
+
+			for _, scanID := range scanIDs {
+				wg.Add(1)
+				go func(pid int64) {
+					defer wg.Done()
+					label := fmt.Sprintf("%s.%s [pid=%d/%d]", tc.Database, tableName, pid, len(scanIDs))
+					log.Printf("Starting: %s (topic=%s)", label, topic)
+
+					rowCount, err := reader.ScanTable(ctx, scanCfg, pid, tableInfo, kafkaProducer, topic)
+					if err != nil {
+						errCh <- fmt.Errorf("[%s] %w", label, err)
+						return
+					}
+
+					atomic.AddInt64(&totalRowCount, rowCount)
+					elapsed := time.Since(partitionStartTime)
+					log.Printf("[%s] Done: %d rows -> topic %s (elapsed=%s)", label, rowCount, topic, elapsed.Round(time.Second))
+				}(scanID)
+			}
+
+			wg.Wait()
+			close(errCh)
+
+			for err := range errCh {
+				if err != nil {
+					log.Printf("ERROR: %v", err)
+					kafkaProducer.Close()
+					os.Exit(1)
+				}
+			}
 		}
 
 		if len(scanIDs) > 1 {
-			log.Printf("[%s.%s] All partitions done: %d total rows -> topic %s", tc.Database, tableName, totalRowCount, topic)
+			log.Printf("[%s.%s] All %d partitions done: %d total rows -> topic %s (total elapsed=%s)",
+				tc.Database, tableName, len(scanIDs), totalRowCount, topic, time.Since(partitionStartTime).Round(time.Second))
 		}
 			kafkaProducer.Close()
 		}
 	}
 
-	log.Println("All tables initialized successfully")
+	log.Printf("=== All tables initialized successfully ===")
+	log.Printf("=== Snapshot TSO: %d ===", effectiveTSO)
+	log.Printf("=== To start TiCDC incremental sync, use: --start-ts=%d ===", effectiveTSO)
 }
 
 func buildConfigFromFlags() *config.Config {

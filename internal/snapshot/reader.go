@@ -7,6 +7,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lizhenhuan/tidb-full-init/internal/encoder"
 	"github.com/lizhenhuan/tidb-full-init/internal/kafka"
@@ -64,6 +65,23 @@ func (r *Reader) ScanTable(
 	var totalRows int64
 	var wg sync.WaitGroup
 	errCh := make(chan error, cfg.Parallelism)
+
+	// Progress reporting goroutine
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				rows := atomic.LoadInt64(&totalRows)
+				log.Printf("[%s.%s pid=%d] progress: %d rows scanned", cfg.Database, cfg.TableName, tableID, rows)
+			}
+		}
+	}()
 
 	for i, kr := range ranges {
 		wg.Add(1)
