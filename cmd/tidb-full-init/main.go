@@ -31,6 +31,7 @@ var (
 	kafkaBootstrap   string
 	kafkaTopicPrefix string
 	kafkaTopic       string
+	kafkaTopicList   string
 	parallelism      int
 	startTSO         uint64
 	mockMode         bool
@@ -48,6 +49,7 @@ func init() {
 	flag.StringVar(&kafkaBootstrap, "kafka-bootstrap", "127.0.0.1:9092", "Kafka bootstrap servers (supports domain, kafka:// prefix, comma-separated list)")
 	flag.StringVar(&kafkaTopicPrefix, "kafka-topic-prefix", "tidb-data-", "Kafka topic prefix (topic = prefix + db + '-' + table)")
 	flag.StringVar(&kafkaTopic, "kafka-topic", "", "Kafka topic (fixed; all tables sent to this single topic, overrides -kafka-topic-prefix)")
+	flag.StringVar(&kafkaTopicList, "kafka-topic-list", "", "Kafka topics matching -tables one-to-one, comma-separated (e.g. topic1,topic2); requires -kafka-topic and -kafka-topic-prefix to be empty")
 	flag.IntVar(&parallelism, "parallelism", 4, "Parallel scan workers per table")
 	flag.Uint64Var(&startTSO, "start-tso", 0, "Start TSO for snapshot scan (0=auto from PD)")
 	flag.BoolVar(&mockMode, "mock", false, "Use mock mode (no real TiKV/Kafka connection)")
@@ -68,6 +70,14 @@ func main() {
 			log.Fatalf("Load config: %v", err)
 		}
 	} else {
+		setFlags := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+		if err := validateTopicListFlags(setFlags); err != nil {
+			log.Fatalf("Invalid flags: %v", err)
+		}
+		if len(parseList(kafkaTopicList)) > 0 {
+			kafkaTopicPrefix = ""
+		}
 		cfg = buildConfigFromFlags()
 	}
 
@@ -75,8 +85,8 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
-	log.Printf("Config: pd=%s tidb=%s:%s kafka=%s prefix=%s topic=%s mock=%v user=%s start-tso=%d",
-		cfg.PDAddresses, cfg.TiDBHost, cfg.TiDBPort, cfg.KafkaBootstrapServers, cfg.KafkaTopicPrefix, cfg.KafkaTopic, mockMode, cfg.Username, startTSO)
+	log.Printf("Config: pd=%s tidb=%s:%s kafka=%s prefix=%s topic=%s topic-list=%v mock=%v user=%s start-tso=%d",
+		cfg.PDAddresses, cfg.TiDBHost, cfg.TiDBPort, cfg.KafkaBootstrapServers, cfg.KafkaTopicPrefix, cfg.KafkaTopic, cfg.KafkaTopicList, mockMode, cfg.Username, startTSO)
 
 	// --- Step 1: Verify TiDB SQL connection BEFORE creating TiKV/Kafka ---
 	var dsn string
@@ -143,15 +153,20 @@ func main() {
 	}
 	log.Printf("=== Snapshot TSO: %d (use --start-ts=%d with TiCDC for incremental sync) ===", effectiveTSO, effectiveTSO)
 
+	tableIndex := 0
 	for _, tc := range cfg.Tables {
 		for _, tableName := range tc.Tables {
 			topic := tc.Topic
-			if topic == "" && cfg.KafkaTopic != "" {
+			if topic == "" && len(cfg.KafkaTopicList) > 0 {
+				// One-to-one mapping: i-th table in -tables -> i-th topic in -kafka-topic-list
+				topic = cfg.KafkaTopicList[tableIndex]
+			} else if topic == "" && cfg.KafkaTopic != "" {
 				// Fixed Kafka topic: all tables sent to this single topic
 				topic = cfg.KafkaTopic
 			} else if topic == "" {
 				topic = cfg.KafkaTopicPrefix + tc.Database + "-" + tableName
 			}
+			tableIndex++
 
 			var kafkaProducer kafka.Producer
 			if mockMode {
@@ -298,12 +313,44 @@ func buildConfigFromFlags() *config.Config {
 		KafkaBootstrapServers: kafkaBootstrap,
 		KafkaTopicPrefix:      kafkaTopicPrefix,
 		KafkaTopic:            kafkaTopic,
+		KafkaTopicList:        parseList(kafkaTopicList),
 		Tables: []config.TableConfig{{
 			Database:    database,
 			Tables:      tables,
 			Parallelism: parallelism,
 		}},
 	}
+}
+
+func parseList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var result []string
+	for _, t := range strings.Split(s, ",") {
+		if trimmed := strings.TrimSpace(t); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func validateTopicListFlags(setFlags map[string]bool) error {
+	topics := parseList(kafkaTopicList)
+	if len(topics) == 0 {
+		return nil
+	}
+	if kafkaTopic != "" {
+		return fmt.Errorf("-kafka-topic must be empty when -kafka-topic-list is set")
+	}
+	if setFlags["kafka-topic-prefix"] && kafkaTopicPrefix != "" {
+		return fmt.Errorf("-kafka-topic-prefix must be empty when -kafka-topic-list is set")
+	}
+	tables := parseTables(tablesFlag)
+	if len(topics) != len(tables) {
+		return fmt.Errorf("-kafka-topic-list has %d topics but -tables has %d tables; they must be one-to-one", len(topics), len(tables))
+	}
+	return nil
 }
 
 func parseTables(s string) []string {
