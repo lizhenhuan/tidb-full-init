@@ -57,9 +57,34 @@ go build -o tidb-verify ./cmd/tidb-verify/
 | `-kafka-bootstrap` | string | `127.0.0.1:9092` | Kafka Broker 地址 |
 | `-kafka-topic-prefix` | string | `tidb-data-` | Kafka Topic 前缀（Topic = prefix + db + "-" + table） |
 | `-kafka-topic` | string | | Kafka Topic 全名（固定Topic，所有表数据发送到同一个Topic，设置后覆盖 -kafka-topic-prefix） |
+| `-kafka-topic-list` | string | | 与 `-tables` 一一对应的 Topic 列表，逗号分隔（如 `t1,t2`）。设置时必须保证 `-kafka-topic`、`-kafka-topic-prefix` 为空，且 Topic 数量与表数量一致 |
 | `-parallelism` | int | `4` | 每张表的并行扫描协程数 |
 | `-start-tso` | uint64 | `0` | 快照起始 TSO（0=自动从 PD 获取） |
 | `-mock` | bool | `false` | Mock 模式（不连接真实 TiKV/Kafka，用于调试） |
+
+### 表与 Topic 一一对应
+
+当需要把每张表的数据写到各自指定的 Topic 时，使用 `-kafka-topic-list`：
+
+```bash
+./tidb-full-init \
+  -pd-addresses "127.0.0.1:2379" \
+  -tidb-host "127.0.0.1" \
+  -tidb-port "4000" \
+  -username "root" \
+  -password "your_password" \
+  -database "mydb" \
+  -tables "orders,users,products" \
+  -kafka-bootstrap "127.0.0.1:9092" \
+  -kafka-topic-list "topic-orders,topic-users,topic-products"
+```
+
+规则：
+
+- `-kafka-topic-list` 中的 Topic 按顺序与 `-tables` 中的表一一对应（第 i 个表 → 第 i 个 Topic）
+- 使用该参数时 `-kafka-topic` 和 `-kafka-topic-prefix` 必须为空；若未显式指定 `-kafka-topic-prefix`，其默认值会被自动忽略
+- Topic 数量必须等于表数量，否则启动即报错
+- 若 JSON 配置中为某张表单独指定了 `tables[].topic`，则该表仍使用自己的 Topic
 
 ### JSON 配置文件
 
@@ -73,6 +98,7 @@ go build -o tidb-verify ./cmd/tidb-verify/
   "kafka-bootstrap-servers": "127.0.0.1:9092",
   "kafka-topic-prefix": "tidb-data-",
   "kafka-topic": "",
+  "kafka-topic-list": [],
   "tables": [
     {
       "database": "mydb",

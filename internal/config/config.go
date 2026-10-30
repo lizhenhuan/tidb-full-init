@@ -22,6 +22,7 @@ type Config struct {
 	KafkaBootstrapServers string                 `json:"kafka-bootstrap-servers"`
 	KafkaTopicPrefix      string                 `json:"kafka-topic-prefix"`
 	KafkaTopic            string                 `json:"kafka-topic,omitempty"`
+	KafkaTopicList        []string               `json:"kafka-topic-list,omitempty"`
 	Tables                []TableConfig          `json:"tables"`
 	KafkaProducerConfig   map[string]interface{} `json:"kafka-producer-config,omitempty"`
 	SnapshotTimestamp     string                 `json:"snapshot-timestamp,omitempty"`
@@ -51,6 +52,19 @@ func LoadConfig(path string) (*Config, error) {
 	cfg := DefaultConfig()
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	if len(cfg.KafkaTopicList) > 0 {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err == nil {
+			var explicitPrefix string
+			if v, ok := raw["kafka-topic-prefix"]; ok {
+				if err := json.Unmarshal(v, &explicitPrefix); err == nil && explicitPrefix != "" {
+					return nil, fmt.Errorf("kafka-topic-prefix must be empty when kafka-topic-list is set")
+				}
+			}
+		}
+		cfg.KafkaTopicPrefix = ""
 	}
 
 	for i, tc := range cfg.Tables {
@@ -92,5 +106,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("tables[%d].tables is required", i)
 		}
 	}
+
+	if len(c.KafkaTopicList) > 0 {
+		if c.KafkaTopic != "" {
+			return fmt.Errorf("kafka-topic must be empty when kafka-topic-list is set")
+		}
+		if c.KafkaTopicPrefix != "" {
+			return fmt.Errorf("kafka-topic-prefix must be empty when kafka-topic-list is set")
+		}
+		total := c.TableCount()
+		if len(c.KafkaTopicList) != total {
+			return fmt.Errorf("kafka-topic-list has %d topics but %d tables are configured; they must be one-to-one", len(c.KafkaTopicList), total)
+		}
+		for i, topic := range c.KafkaTopicList {
+			if topic == "" {
+				return fmt.Errorf("kafka-topic-list[%d] is empty", i)
+			}
+		}
+	}
+
 	return nil
+}
+
+func (c *Config) TableCount() int {
+	total := 0
+	for _, tc := range c.Tables {
+		total += len(tc.Tables)
+	}
+	return total
 }
